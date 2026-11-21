@@ -1,7 +1,7 @@
 'use strict';
 
 // =================================================================================================
-// all_in_one_v5.js - BẢN FULL FIX + MAX 2 LOSS CONTROL
+// all_in_one_v5.js - BẢN FULL FIX + MAX 2 LOSS CONTROL + MULTI-APP COMPATIBLE (KODER / TERMUX / VPS)
 // ✅ FIX: File cắt cụt - hoàn thiện startup + listen
 // ✅ FIX: Markov update - build lại chain từ data thật mỗi lần dự đoán
 // ✅ FIX: Bayesian - dùng log-space tránh underflow + công thức đúng
@@ -16,15 +16,66 @@
 // ✅ ADD: MAX_CONSECUTIVE_LOSS = 2 - KHÔNG BAO GIỜ SAI QUÁ 2 TAY LIÊN TIẾP
 // ✅ ADD: Format JSON dự đoán: phienDuDoan, duDoan, doTinCay, giaiThich, idol
 // ✅ ADD: Giai thich chi tiết từ tất cả pattern
+// ✅ ADD: Tương thích Koder, Termux, a-Shell, Windows VPS, Render & các runtime khác
 // =================================================================================================
 
-const express    = require('express');
-const axios      = require('axios');
+const path       = require('path');
+const os         = require('os');
 const fs         = require('fs');
-const WebSocket  = require('ws');
+
+function loadRequiredModule(modName) {
+    try {
+        return require(modName);
+    } catch (err) {
+        console.error(`[RUNTIME] Thiếu gói "${modName}". Hãy chạy: npm install express axios ws`);
+        throw err;
+    }
+}
+
+const express    = loadRequiredModule('express');
+const axios      = loadRequiredModule('axios');
+const WebSocket  = loadRequiredModule('ws');
+
+// ========================== TƯƠNG THÍCH ĐA APP (KODER / TERMUX / VPS / CLOUD) ==========================
+function resolveWritableDir() {
+    const candidates = [
+        process.cwd(),
+        typeof __dirname !== 'undefined' ? __dirname : null,
+        os.tmpdir()
+    ].filter(Boolean);
+
+    for (const dir of candidates) {
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            const testFile = path.join(dir, `.koder_write_test_${process.pid}.tmp`);
+            fs.writeFileSync(testFile, 'ok', 'utf8');
+            fs.unlinkSync(testFile);
+            return dir;
+        } catch (_) {
+            // Thử thư mục kế tiếp nếu môi trường hiện tại không cho ghi (ví dụ sandbox trên Koder)
+        }
+    }
+    return os.tmpdir();
+}
+
+const RUNTIME_DIR = resolveWritableDir();
+const DATA_DIR    = path.join(RUNTIME_DIR, 'data_store');
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+
+function resolveDataFilePath(filename) {
+    if (path.isAbsolute(filename)) return filename;
+    const localPath = path.join(process.cwd(), filename);
+    if (fs.existsSync(localPath)) return localPath;
+    const dirPath = path.join(RUNTIME_DIR, filename);
+    if (fs.existsSync(dirPath)) return dirPath;
+    const storePath = path.join(DATA_DIR, filename);
+    if (fs.existsSync(storePath)) return storePath;
+    return path.join(RUNTIME_DIR, filename);
+}
 
 // ========================== CẤU HÌNH ==========================
-const PORT        = process.env.PORT || 8080;
+const PORT        = Number(process.env.PORT) || 8080;
+const HOST        = process.env.HOST || '0.0.0.0';
 const MAX_HISTORY = 200;
 const LOG_PREFIX  = () => `[${new Date().toISOString()}]`;
 const log         = (msg) => console.log(`${LOG_PREFIX()} ${msg}`);
@@ -1855,18 +1906,21 @@ function start_sicbosum_ws() {
 // =================================================================================================
 function lc79_loadLearningData() {
     try {
-        if (fs.existsSync(LC79_LEARNING_FILE)) {
-            const data=JSON.parse(fs.readFileSync(LC79_LEARNING_FILE,'utf8'));
+        const targetFile = resolveDataFilePath(LC79_LEARNING_FILE);
+        if (fs.existsSync(targetFile)) {
+            const data=JSON.parse(fs.readFileSync(targetFile,'utf8'));
             if (data.history) { lc79_predictionHistory=data.history; lc79_lastProcessedPhien=data.lastProcessedPhien||{hu:null,md5:null}; }
             if (data.learningData) lc79_learningData={...lc79_learningData,...data.learningData};
             if (data.antiLossState) Object.assign(ANTI_LOSS_STATE, data.antiLossState);
-            log('Learning data loaded from '+LC79_LEARNING_FILE);
+            log('Learning data loaded from '+targetFile);
         }
     } catch(e) { logError('Error loading learning data:',e); }
 }
 function lc79_saveLearningData() {
     try {
-        fs.writeFileSync(LC79_LEARNING_FILE, JSON.stringify({ history:lc79_predictionHistory, lastProcessedPhien:lc79_lastProcessedPhien, learningData:lc79_learningData, antiLossState:ANTI_LOSS_STATE, lastSaved:new Date().toISOString() }, null, 2));
+        const targetFile = resolveDataFilePath(LC79_LEARNING_FILE);
+        fs.mkdirSync(path.dirname(targetFile), { recursive: true });
+        fs.writeFileSync(targetFile, JSON.stringify({ history:lc79_predictionHistory, lastProcessedPhien:lc79_lastProcessedPhien, learningData:lc79_learningData, antiLossState:ANTI_LOSS_STATE, lastSaved:new Date().toISOString() }, null, 2));
     } catch(e) { logError('Error saving learning data:',e); }
 }
 
@@ -1921,9 +1975,10 @@ function load_json_predictor_state(key) {
     const cfg=JSON_FILE_MAP[key];
     if (!cfg) return false;
     try {
-        if (!fs.existsSync(cfg.file)) { log(`[JSON-PREDICTOR] File not found: ${cfg.file}`); return false; }
-        const data=JSON.parse(fs.readFileSync(cfg.file,'utf8'));
-        JSON_PREDICTOR_STATE[key]={ history:Array.isArray(data.history)?data.history:[], book:data.book||{}, anti:data.anti||{}, pred_log:Array.isArray(data.pred_log)?data.pred_log:[], model_stats:data.model_stats||{}, last_pred:data.last_pred||null, last_phien:data.last_phien||null, game:cfg.game, table:cfg.table, file:cfg.file, src:cfg.src, dirty:false, loadedAt:new Date().toISOString() };
+        const targetFile = resolveDataFilePath(cfg.file);
+        if (!fs.existsSync(targetFile)) { log(`[JSON-PREDICTOR] File not found: ${cfg.file}`); return false; }
+        const data=JSON.parse(fs.readFileSync(targetFile,'utf8'));
+        JSON_PREDICTOR_STATE[key]={ history:Array.isArray(data.history)?data.history:[], book:data.book||{}, anti:data.anti||{}, pred_log:Array.isArray(data.pred_log)?data.pred_log:[], model_stats:data.model_stats||{}, last_pred:data.last_pred||null, last_phien:data.last_phien||null, game:cfg.game, table:cfg.table, file:targetFile, src:cfg.src, dirty:false, loadedAt:new Date().toISOString() };
         log(`[JSON-PREDICTOR] Loaded ${key}: ${JSON_PREDICTOR_STATE[key].history.length} history, ${Object.keys(JSON_PREDICTOR_STATE[key].book).length} patterns`);
         return true;
     } catch(e) { logError(`[JSON-PREDICTOR] Load ${key} error:`,e); return false; }
@@ -1932,7 +1987,9 @@ function save_json_predictor_state(key) {
     const st=JSON_PREDICTOR_STATE[key];
     if (!st) return false;
     try {
-        fs.writeFileSync(st.file, JSON.stringify({history:st.history,book:st.book,anti:st.anti,pred_log:st.pred_log,model_stats:st.model_stats,last_pred:st.last_pred,last_phien:st.last_phien},null,2));
+        const targetFile = resolveDataFilePath(st.file);
+        fs.mkdirSync(path.dirname(targetFile), { recursive: true });
+        fs.writeFileSync(targetFile, JSON.stringify({history:st.history,book:st.book,anti:st.anti,pred_log:st.pred_log,model_stats:st.model_stats,last_pred:st.last_pred,last_phien:st.last_phien},null,2));
         st.dirty=false; return true;
     } catch(e) { logError(`[JSON-PREDICTOR] Save ${key} error:`,e); return false; }
 }
@@ -2086,8 +2143,9 @@ function loadAllJsonData() {
     ];
     for (const fi of jsonFiles) {
         try {
-            if (!fs.existsSync(fi.path)) continue;
-            const data=JSON.parse(fs.readFileSync(fi.path,'utf8'));
+            const targetFile = resolveDataFilePath(fi.path);
+            if (!fs.existsSync(targetFile)) continue;
+            const data=JSON.parse(fs.readFileSync(targetFile,'utf8'));
             if (data.history && Array.isArray(data.history)) {
                 if (!DATA_STORE[fi.game]) DATA_STORE[fi.game]={};
                 if (!DATA_STORE[fi.game][fi.table]) DATA_STORE[fi.game][fi.table]=[];
@@ -2100,7 +2158,7 @@ function loadAllJsonData() {
                         target.push({phien, xuc_xac:[0,0,0], tong:result==='T'?11:10, ket_qua:result==='T'?'Tài':'Xỉu', fromJson:true});
                     });
                 } else { target.push(...data.history); }
-                log(`Loaded ${target.length} records from ${fi.path} → ${fi.game}/${fi.table}`);
+                log(`Loaded ${target.length} records from ${targetFile} → ${fi.game}/${fi.table}`);
             }
         } catch(err) { logError(`Error loading ${fi.path}:`,err); }
     }
@@ -2174,6 +2232,7 @@ app.get('/',(req,res)=>{
     res.json({
         status:"ALL-IN-ONE Tài Xỉu API v5 - MAX 2 LOSS CONTROL",
         version:"v5 - Hard stop after 2 consecutive losses + JSON format chuẩn",
+        runtime_dir: RUNTIME_DIR,
         endpoints:{
             predict:["/predict/:game/:table","/predict/all"],
             lc79:["/lc79-hu","/lc79-md5","/lc79-hu/analysis","/lc79-md5/analysis","/lc79-hu/learning","/lc79-md5/learning"],
@@ -2515,9 +2574,10 @@ app.get('/predict/all', async (req, res) => {
 });
 
 // ========================== START SERVER ==========================
-const server = app.listen(PORT, () => {
-    log(`🚀 SERVER STARTED ON PORT ${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+    log(`🚀 SERVER STARTED ON http://${HOST}:${PORT}`);
     log(`📡 API: http://localhost:${PORT}`);
+    log(`📁 RUNTIME DIR: ${RUNTIME_DIR}`);
     log(`🛑 ANTI-LOSS: MAX 2 CONSECUTIVE LOSS - HARD STOP AFTER 2`);
     log(`📊 HARD_STOP_AT: ${ANTI_LOSS.HARD_STOP_AT}`);
     log(`🔄 FORCE_REVERSE_AT: ${ANTI_LOSS.FORCE_REVERSE_AT}`);
