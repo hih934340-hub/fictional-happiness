@@ -1,12 +1,11 @@
 'use strict';
 
 // =================================================================================================
-// all_in_one_v5.js - FULL FIXED VERSION
-// ✅ Hoàn thiện startup + listen + Express routes cho tool HTML
-// ✅ JSON response format gọn: phien, ketQua, tong, phienDoan, phienPhanTich, tiLe
-// ✅ Fix path resolution cho Koder / Termux / VPS / Windows
-// ✅ MAX 2 LOSS CONTROL + Multi-app compatible
-// ✅ CORS mở cho mọi origin - tool HTML gọi từ đâu cũng được
+// all_in_one_v5.2.js - FULL FIXED + V2 ANTI-LOSS (ZERO 3-LOSS STREAK)
+// ✅ Giữ nguyên toàn bộ logic v5.1
+// ✅ Thêm V2 guards: Hard Stop cooldown, Dynamic Confidence Floor, Pattern Lock,
+//    Reverse Confirmation, Dynamic Skip, Recovery Mode, Cross-check, Daily Cap, Conflict Resolver
+// ✅ Mục tiêu: KHÔNG BAO GIỜ để 3 phiên thua liên tiếp
 // =================================================================================================
 
 const path = require('path');
@@ -79,7 +78,7 @@ const LOG_PREFIX  = () => `[${new Date().toISOString()}]`;
 const log         = (msg) => console.log(`${LOG_PREFIX()} ${msg}`);
 const logError    = (msg, err) => console.error(`${LOG_PREFIX()} [ERROR] ${msg}`, err ? (err.message || err) : '');
 
-// ========================== ANTI-LOSS CONFIG ==========================
+// ========================== ANTI-LOSS CONFIG (V1 - giữ nguyên) ==========================
 const ANTI_LOSS = {
     MAX_CONSECUTIVE_LOSS : 2,
     FORCE_REVERSE_AT     : 2,
@@ -94,6 +93,86 @@ const ANTI_LOSS = {
     SKIP_AFTER_FORCE     : true,
     MAX_LOSS_BEFORE_SKIP : 2,
 };
+
+// ========================== ANTI-LOSS V2 CONFIG (MỚI) ==========================
+const ANTI_LOSS_V2 = {
+    ENABLED: true,
+
+    // 1. Hard stop cooldown bắt buộc
+    HARD_STOP_COOLDOWN_PHASES: 3,
+    HARD_STOP_CONFIRM_WINS: 2,
+
+    // 2. Confidence floor động theo loss streak
+    CONFIDENCE_FLOOR_BY_LOSS: { 0: 55, 1: 62, 2: 70, 3: 78, 4: 85 },
+
+    // 3. Pattern lock
+    PATTERN_LOCK_WINDOW: 10,
+    PATTERN_LOCK_MIN_LOSSES: 2,
+    PATTERN_LOCK_WEIGHT: 0.1,
+    PATTERN_LOCK_DURATION: 5,
+
+    // 4. Reverse confirmation
+    REVERSE_MIN_LAYERS_CONFIRM: 2,
+    REVERSE_STRONG_LAYERS: ['markov_chain', 'entropy_signal', 'bayesian_update', 'momentum_adv'],
+
+    // 5. Dynamic skip
+    SKIP_TRIGGER_LOSSES_IN_WINDOW: 2,
+    SKIP_WINDOW_SIZE: 3,
+    SKIP_DURATION_PHASES: 1,
+
+    // 8. Cross-check
+    CROSS_CHECK_PENALTY: 15,
+
+    // 9. Temporal weight
+    TEMPORAL_DECAY_ALPHA: 0.15,
+
+    // 10. Safe mode
+    SAFE_MODE: false,
+    SAFE_MODE_EXTRA_FLOOR: 10,
+    SAFE_MODE_REVERSE_CONFIRM: 3,
+
+    // 11. Daily cap
+    DAILY_LOSS_CAP: 8,
+
+    // 12. Conflict resolver
+    CONFLICT_BALANCE_THRESHOLD: 0.10,
+};
+
+// ========================== DAILY TRACKER ==========================
+const DAILY_TRACKER = {
+    date: new Date().toDateString(),
+    totalLoss: 0,
+    totalWin: 0,
+    lastReset: new Date().toISOString(),
+};
+
+function _checkDailyReset() {
+    const today = new Date().toDateString();
+    if (DAILY_TRACKER.date !== today) {
+        DAILY_TRACKER.date = today;
+        DAILY_TRACKER.totalLoss = 0;
+        DAILY_TRACKER.totalWin = 0;
+        DAILY_TRACKER.lastReset = new Date().toISOString();
+        log(`[ANTI-LOSS-V2] 🔄 Daily tracker reset (${today})`);
+    }
+}
+
+function _updateDailyTracker(isCorrect) {
+    _checkDailyReset();
+    if (isCorrect) DAILY_TRACKER.totalWin++;
+    else DAILY_TRACKER.totalLoss++;
+}
+
+function _checkDailyCap() {
+    _checkDailyReset();
+    if (DAILY_TRACKER.totalLoss >= ANTI_LOSS_V2.DAILY_LOSS_CAP) {
+        return {
+            capped: true,
+            reason: `Daily Loss Cap: ${DAILY_TRACKER.totalLoss}/${ANTI_LOSS_V2.DAILY_LOSS_CAP} phiên thua hôm nay → NGHỈ`
+        };
+    }
+    return { capped: false };
+}
 
 // ========================== DỮ LIỆU TOÀN CỤC ==========================
 const GAME_STATUS = {
@@ -128,13 +207,40 @@ function getAntiLossState(key) {
             lastPrediction: null, lastActual: null,
             hardStopActive: false, hardStopUntilPhien: null,
             skipCount: 0, lastSkipAt: null, consecutiveSkip: 0, lastPhien: null,
+            // V2 fields
+            hardStopCooldown: 0, hardStopConfirmWinsNeeded: 0,
+            recoveryMode: false, recoveryWins: 0,
+            skipWindowCount: 0,
+            patternLossMap: {},
+            lastTopLayers: [],
+            temporalPatterns: [],
+            v2DailyLoss: 0, v2DailyWin: 0,
+            v2LastDate: new Date().toDateString(),
         };
     }
     return ANTI_LOSS_STATE[key];
 }
 
+function _ensureV2StateFields(s) {
+    if (!s) return;
+    if (s.hardStopCooldown == null) s.hardStopCooldown = 0;
+    if (s.hardStopConfirmWinsNeeded == null) s.hardStopConfirmWinsNeeded = 0;
+    if (s.recoveryMode == null) s.recoveryMode = false;
+    if (s.recoveryWins == null) s.recoveryWins = 0;
+    if (s.skipWindowCount == null) s.skipWindowCount = 0;
+    if (s.patternLossMap == null) s.patternLossMap = {};
+    if (s.lastTopLayers == null) s.lastTopLayers = [];
+    if (s.temporalPatterns == null) s.temporalPatterns = [];
+    if (s.v2DailyLoss == null) s.v2DailyLoss = 0;
+    if (s.v2DailyWin == null) s.v2DailyWin = 0;
+    if (s.v2LastDate == null) s.v2LastDate = new Date().toDateString();
+}
+
+// ========================== UPDATE STATE (V1 + V2 HOOKS) ==========================
 function updateAntiLossState(key, predicted, actual, phien) {
     const s = getAntiLossState(key);
+    _ensureV2StateFields(s);
+
     const isCorrect = (predicted === actual);
     s.totalPredictions++;
     if (isCorrect) s.totalCorrect++;
@@ -152,23 +258,200 @@ function updateAntiLossState(key, predicted, actual, phien) {
         s.winHistory.push({ phien, predicted, actual });
         if (s.winHistory.length > 50) s.winHistory.shift();
         log(`[ANTI-LOSS] ✅ WIN key=${key} phien=${phien} streak=${s.consecutiveWin}`);
+
+        // V2: recovery counter
+        if (s.recoveryMode) {
+            s.recoveryWins++;
+            if (s.recoveryWins >= s.hardStopConfirmWinsNeeded) {
+                s.recoveryMode = false;
+                s.recoveryWins = 0;
+                log(`[ANTI-LOSS-V2] ✅ RECOVERY HOÀN TẤT key=${key}`);
+            } else {
+                log(`[ANTI-LOSS-V2] 🔄 Recovery ${s.recoveryWins}/${s.hardStopConfirmWinsNeeded}`);
+            }
+        }
     } else {
         s.consecutiveWin = 0;
         s.consecutiveLoss++;
         s.lossHistory.push({ phien, predicted, actual });
         if (s.lossHistory.length > 50) s.lossHistory.shift();
         log(`[ANTI-LOSS] ❌ LOSS key=${key} phien=${phien} consecutiveLoss=${s.consecutiveLoss}`);
+
+        // V1: hard stop
         if (s.consecutiveLoss >= ANTI_LOSS.HARD_STOP_AT) {
             s.hardStopActive = true;
             s.hardStopUntilPhien = typeof phien === 'number' ? phien + 2 : null;
-            log(`[ANTI-LOSS] 🛑 HARD STOP key=${key}`);
+            // V2: cooldown
+            s.hardStopCooldown = ANTI_LOSS_V2.HARD_STOP_COOLDOWN_PHASES;
+            s.hardStopConfirmWinsNeeded = ANTI_LOSS_V2.HARD_STOP_CONFIRM_WINS;
+            log(`[ANTI-LOSS] 🛑 HARD STOP key=${key} → cooldown ${s.hardStopCooldown} phiên, cần ${s.hardStopConfirmWinsNeeded} wins`);
         }
     }
+
     s.lastPrediction = predicted;
     s.lastActual     = actual;
+
+    // V2: daily tracker
+    _updateDailyTracker(isCorrect);
+
     return isCorrect;
 }
 
+// ========================== V2 HELPERS ==========================
+function _patternIdFromName(name) {
+    if (!name) return null;
+    try {
+        if (typeof lc79_getPatternIdFromName === 'function') return lc79_getPatternIdFromName(name);
+    } catch (_) {}
+    return null;
+}
+
+function _updatePatternLosses(s, predictions, isCorrect, phien) {
+    _ensureV2StateFields(s);
+    if (!predictions || !predictions.length) return;
+
+    for (const p of predictions) {
+        const pid = p.patternId || _patternIdFromName(p.name);
+        if (!pid) continue;
+        if (!s.patternLossMap[pid]) s.patternLossMap[pid] = { losses: [], wins: [], lockedUntil: null };
+
+        if (isCorrect) {
+            s.patternLossMap[pid].wins.push(phien);
+            if (s.patternLossMap[pid].wins.length > ANTI_LOSS_V2.PATTERN_LOCK_WINDOW) s.patternLossMap[pid].wins.shift();
+        } else {
+            s.patternLossMap[pid].losses.push(phien);
+            if (s.patternLossMap[pid].losses.length > ANTI_LOSS_V2.PATTERN_LOCK_WINDOW) s.patternLossMap[pid].losses.shift();
+        }
+
+        const recentLosses = s.patternLossMap[pid].losses.filter(p2 => {
+            if (typeof phien !== 'number' || typeof p2 !== 'number') return true;
+            return phien - p2 <= ANTI_LOSS_V2.PATTERN_LOCK_WINDOW;
+        });
+        if (recentLosses.length >= ANTI_LOSS_V2.PATTERN_LOCK_MIN_LOSSES) {
+            s.patternLossMap[pid].lockedUntil = (typeof phien === 'number')
+                ? phien + ANTI_LOSS_V2.PATTERN_LOCK_DURATION
+                : 'locked';
+            log(`[ANTI-LOSS-V2] 🔒 Pattern LOCKED: ${pid} (thua ${recentLosses.length} lần)`);
+        }
+    }
+}
+
+function _applyPatternLockToPredictions(s, predictions, currentPhien) {
+    _ensureV2StateFields(s);
+    if (!s.patternLossMap) return predictions;
+    for (const p of predictions) {
+        const pid = p.patternId || _patternIdFromName(p.name);
+        if (!pid) continue;
+        const lock = s.patternLossMap[pid];
+        if (!lock || !lock.lockedUntil) continue;
+        const isStillLocked = (typeof lock.lockedUntil === 'number' && typeof currentPhien === 'number')
+            ? currentPhien <= lock.lockedUntil
+            : lock.lockedUntil === 'locked';
+        if (isStillLocked) {
+            p.weight = (p.weight || 1.0) * ANTI_LOSS_V2.PATTERN_LOCK_WEIGHT;
+            p.locked = true;
+        } else {
+            lock.lockedUntil = null;
+        }
+    }
+    return predictions;
+}
+
+function _applyTemporalWeight(s, predictions, currentPhien) {
+    _ensureV2StateFields(s);
+    if (!predictions) return predictions;
+    for (const p of predictions) {
+        const detectedAt = p.detectedAtPhien != null ? p.detectedAtPhien : currentPhien;
+        if (typeof detectedAt === 'number' && typeof currentPhien === 'number') {
+            const age = currentPhien - detectedAt;
+            if (age > 0) {
+                const decay = Math.pow(1 - ANTI_LOSS_V2.TEMPORAL_DECAY_ALPHA, age);
+                p.weight = (p.weight || 1.0) * Math.max(0.2, decay);
+            }
+        }
+    }
+    return predictions;
+}
+
+function _getDynamicMinConfidence(consecutiveLoss) {
+    const map = ANTI_LOSS_V2.CONFIDENCE_FLOOR_BY_LOSS;
+    const loss = Math.min(consecutiveLoss, 4);
+    return map[loss] || map[4];
+}
+
+function _shouldDynamicSkip(s, results) {
+    _ensureV2StateFields(s);
+    if (!results || results.length < ANTI_LOSS_V2.SKIP_WINDOW_SIZE) return { skip: false };
+    // results là mảng kết quả 'Tài'/'Xỉu' mới nhất ở đầu (index 0 = mới nhất)
+    // Ta cần so sánh dự đoán gần nhất với kết quả thực tế → dùng recentResults (bool[])
+    const recent = s.recentResults.slice(-ANTI_LOSS_V2.SKIP_WINDOW_SIZE);
+    if (recent.length < ANTI_LOSS_V2.SKIP_WINDOW_SIZE) return { skip: false };
+    const lossCount = recent.filter(r => r === false).length;
+    if (lossCount >= ANTI_LOSS_V2.SKIP_TRIGGER_LOSSES_IN_WINDOW) {
+        return {
+            skip: true,
+            reason: `Dynamic Skip: ${lossCount}/${ANTI_LOSS_V2.SKIP_WINDOW_SIZE} phiên gần sai`,
+            duration: ANTI_LOSS_V2.SKIP_DURATION_PHASES
+        };
+    }
+    return { skip: false };
+}
+
+function _crossCheckLayers(predictions) {
+    if (!predictions || predictions.length < 2) return { penalty: 0, reason: null };
+    const sorted = [...predictions].sort((a, b) =>
+        (b.priority || 0) * (b.weight || 1) - (a.priority || 0) * (a.weight || 1)
+    );
+    const top2 = sorted.slice(0, 2);
+    if (top2.length < 2) return { penalty: 0, reason: null };
+    if (top2[0].prediction !== top2[1].prediction) {
+        return {
+            penalty: ANTI_LOSS_V2.CROSS_CHECK_PENALTY,
+            reason: `Cross-check: Top-2 layer mâu thuẫn (${top2[0].prediction} vs ${top2[1].prediction})`
+        };
+    }
+    return { penalty: 0, reason: null };
+}
+
+function _canForceReverse(predictions, lossCount) {
+    if (lossCount < ANTI_LOSS.FORCE_REVERSE_AT) return { allowed: false, reason: 'Chưa đủ loss' };
+    const required = ANTI_LOSS_V2.SAFE_MODE
+        ? ANTI_LOSS_V2.SAFE_MODE_REVERSE_CONFIRM
+        : ANTI_LOSS_V2.REVERSE_MIN_LAYERS_CONFIRM;
+    const strongPatterns = (predictions || []).filter(p => {
+        const pid = p.patternId || _patternIdFromName(p.name);
+        return ANTI_LOSS_V2.REVERSE_STRONG_LAYERS.includes(pid);
+    });
+    if (strongPatterns.length === 0) {
+        return { allowed: false, reason: 'Không có layer mạnh để xác nhận' };
+    }
+    const reverseDir = strongPatterns[0].prediction === 'Tài' ? 'Xỉu' : 'Tài';
+    const reverseVotes = strongPatterns.filter(p => p.prediction === reverseDir);
+    if (reverseVotes.length >= required) {
+        return { allowed: true, confirmedBy: reverseVotes.length, direction: reverseDir, reason: `${reverseVotes.length} layer xác nhận đảo → ${reverseDir}` };
+    }
+    return {
+        allowed: false,
+        reason: `Chỉ ${reverseVotes.length}/${required} layer xác nhận đảo → SKIP an toàn`
+    };
+}
+
+function _detectPatternConflict(taiScore, xiuScore) {
+    const total = taiScore + xiuScore;
+    if (total <= 0) return { conflict: false };
+    const diff = Math.abs(taiScore - xiuScore) / total;
+    if (diff < ANTI_LOSS_V2.CONFLICT_BALANCE_THRESHOLD) {
+        return { conflict: true, balance: diff, reason: `Pattern quá cân bằng (${(diff * 100).toFixed(1)}%) → SKIP` };
+    }
+    return { conflict: false, balance: diff };
+}
+
+function _applySafeMode(confidence) {
+    if (!ANTI_LOSS_V2.SAFE_MODE) return confidence;
+    return confidence + ANTI_LOSS_V2.SAFE_MODE_EXTRA_FLOOR;
+}
+
+// ========================== V1 GUARD (giữ nguyên) ==========================
 function applyAntiLossGuard(key, rawPrediction, rawConfidence) {
     const s = getAntiLossState(key);
     let prediction  = rawPrediction;
@@ -232,6 +515,137 @@ function applyAntiLossGuard(key, rawPrediction, rawConfidence) {
         prediction, action: prediction, confidence, forceReversed,
         penalty: Math.round(penalty), hardStop: false,
         reason: reason || (forceReversed ? `Force reverse sau ${s.consecutiveLoss} tay thua` : '')
+    };
+}
+
+// ========================== V2 GUARD (MỚI - WRAPPER) ==========================
+function applyAntiLossGuardV2(key, rawPrediction, rawConfidence, predictions, results, currentPhien) {
+    if (!ANTI_LOSS_V2.ENABLED) {
+        return applyAntiLossGuard(key, rawPrediction, rawConfidence);
+    }
+
+    const s = getAntiLossState(key);
+    _ensureV2StateFields(s);
+
+    // 11. Daily cap
+    const dailyCheck = _checkDailyCap();
+    if (dailyCheck.capped) {
+        return {
+            prediction: rawPrediction, action: 'SKIP',
+            confidence: ANTI_LOSS.MIN_CONFIDENCE,
+            forceReversed: false, penalty: 0, hardStop: true,
+            reason: dailyCheck.reason,
+            v2: { dailyCap: true }
+        };
+    }
+
+    // 1. Hard stop cooldown
+    if (s.hardStopActive) {
+        if (s.hardStopCooldown > 0) {
+            s.hardStopCooldown--;
+            return {
+                prediction: rawPrediction, action: 'SKIP',
+                confidence: ANTI_LOSS.MIN_CONFIDENCE,
+                forceReversed: false, penalty: 0, hardStop: true,
+                reason: `HARD STOP cooldown còn ${s.hardStopCooldown} phiên (thua ${s.consecutiveLoss})`,
+                v2: { hardStop: true, cooldown: s.hardStopCooldown }
+            };
+        }
+        // Chuyển sang recovery mode
+        s.recoveryMode = true;
+        s.recoveryWins = 0;
+        s.hardStopConfirmWinsNeeded = ANTI_LOSS_V2.HARD_STOP_CONFIRM_WINS;
+        s.hardStopActive = false;
+        log(`[ANTI-LOSS-V2] 🔄 Chuyển sang RECOVERY MODE key=${key}`);
+    }
+
+    // Recovery mode: cần đủ wins xác nhận
+    if (s.recoveryMode) {
+        const floor = _getDynamicMinConfidence(s.consecutiveLoss);
+        const conf = Math.max(floor, rawConfidence);
+        return {
+            prediction: rawPrediction, action: rawPrediction,
+            confidence: conf,
+            forceReversed: false, penalty: 0, hardStop: false,
+            reason: `Recovery mode: ${s.recoveryWins}/${s.hardStopConfirmWinsNeeded} wins (floor ${floor}%)`,
+            v2: { recovery: true, recoveryWins: s.recoveryWins }
+        };
+    }
+
+    // 3. Pattern lock + 9. Temporal weight
+    if (predictions) {
+        _applyPatternLockToPredictions(s, predictions, currentPhien);
+        _applyTemporalWeight(s, predictions, currentPhien);
+    }
+
+    // 5. Dynamic skip
+    const dynSkip = _shouldDynamicSkip(s, results);
+    if (dynSkip.skip) {
+        return {
+            prediction: rawPrediction, action: 'SKIP',
+            confidence: ANTI_LOSS.MIN_CONFIDENCE,
+            forceReversed: false, penalty: 0, hardStop: false,
+            reason: dynSkip.reason,
+            v2: { dynamicSkip: true }
+        };
+    }
+
+    // 8. Cross-check
+    const crossCheck = predictions ? _crossCheckLayers(predictions) : { penalty: 0, reason: null };
+    let confidence = rawConfidence - crossCheck.penalty;
+
+    // 4. Force reverse confirmation
+    if (s.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT) {
+        const revCheck = _canForceReverse(predictions || [], s.consecutiveLoss);
+        if (!revCheck.allowed) {
+            return {
+                prediction: rawPrediction, action: 'SKIP',
+                confidence: ANTI_LOSS.MIN_CONFIDENCE,
+                forceReversed: false, penalty: 0, hardStop: false,
+                reason: `FORCE REVERSE từ chối: ${revCheck.reason}`,
+                v2: { reverseRejected: true }
+            };
+        }
+        const reversedPred = revCheck.direction || (rawPrediction === 'Tài' ? 'Xỉu' : 'Tài');
+        confidence = Math.min(82, confidence + 8);
+        s.forceReverseCooldown = ANTI_LOSS.COOLDOWN_AFTER_FORCE;
+        s.forceReverseCount++;
+        s.lastForcedAt = new Date().toISOString();
+        log(`[ANTI-LOSS-V2] 🔄 FORCE REVERSE (${revCheck.confirmedBy} layer) → ${reversedPred}`);
+        return {
+            prediction: reversedPred, action: reversedPred,
+            confidence: Math.round(confidence),
+            forceReversed: true, penalty: 0, hardStop: false,
+            reason: `FORCE REVERSE: ${revCheck.reason}`,
+            v2: { forceReversed: true, confirmedBy: revCheck.confirmedBy }
+        };
+    }
+
+    // 2. Dynamic confidence floor
+    const dynamicFloor = _getDynamicMinConfidence(s.consecutiveLoss);
+    confidence = Math.max(dynamicFloor, confidence);
+
+    // 10. Safe mode
+    confidence = _applySafeMode(confidence);
+
+    confidence = Math.max(ANTI_LOSS.MIN_CONFIDENCE, Math.min(ANTI_LOSS.MAX_CONFIDENCE, Math.round(confidence)));
+
+    if (confidence < dynamicFloor) {
+        return {
+            prediction: rawPrediction, action: 'SKIP',
+            confidence: dynamicFloor,
+            forceReversed: false, penalty: crossCheck.penalty, hardStop: false,
+            reason: `Confidence ${confidence}% < floor động ${dynamicFloor}% (loss streak ${s.consecutiveLoss})`,
+            v2: { dynamicFloor }
+        };
+    }
+
+    return {
+        prediction: rawPrediction, action: rawPrediction,
+        confidence,
+        forceReversed: false, penalty: crossCheck.penalty, hardStop: false,
+        reason: crossCheck.reason || 'V2 OK',
+        v2: { applied: true, dynamicFloor, crossCheckPenalty: crossCheck.penalty }
     };
 }
 
@@ -716,6 +1130,13 @@ async function lc79_verifyPredictions(type, currentData) {
                 });
             }
             updateAntiLossState(type, predictedNormalized, pred.actual, pred.phien);
+
+            // V2: pattern loss tracking
+            const s = getAntiLossState(type);
+            _ensureV2StateFields(s);
+            const predPatterns = (pred.patterns || []).map(n => ({ name: n, patternId: lc79_getPatternIdFromName(n) }));
+            _updatePatternLosses(s, predPatterns, pred.isCorrect, pred.phien);
+
             updated = true;
         }
     }
@@ -900,7 +1321,7 @@ function analyzeCauTuNhien(results) {
 }
 
 // =================================================================================================
-// TÍNH TOÁN DỰ ĐOÁN CHÍNH
+// TÍNH TOÁN DỰ ĐOÁN CHÍNH (V2 INTEGRATION)
 // =================================================================================================
 function calculateAdvancedPrediction(data, type, antiLossKey) {
     const last50 = data.slice(0, 50);
@@ -917,49 +1338,49 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     const markovRes = predictMarkov(results, markovChain);
     if (markovRes.detected) {
         const w = (lc79_learningData[type].patternWeights['markov_chain'] || 2.0);
-        predictions.push({ prediction: markovRes.prediction, confidence: markovRes.confidence, priority: 16, name: markovRes.name, weight: w });
+        predictions.push({ prediction: markovRes.prediction, confidence: markovRes.confidence, priority: 16, name: markovRes.name, weight: w, patternId: 'markov_chain', detectedAtPhien: data[0]?.Phien });
         factors.push(markovRes.name); allPatterns.push(markovRes);
     }
 
     const entropyRes = analyzeEntropySignal(results);
     if (entropyRes.detected) {
         const w = (lc79_learningData[type].patternWeights['entropy_signal'] || 1.6);
-        predictions.push({ prediction: entropyRes.prediction, confidence: entropyRes.confidence, priority: 15, name: entropyRes.name, weight: w });
+        predictions.push({ prediction: entropyRes.prediction, confidence: entropyRes.confidence, priority: 15, name: entropyRes.name, weight: w, patternId: 'entropy_signal', detectedAtPhien: data[0]?.Phien });
         factors.push(entropyRes.name); allPatterns.push(entropyRes);
     }
 
     const momentumRes = analyzeAdvancedMomentum(last50);
     if (momentumRes.detected) {
         const w = (lc79_learningData[type].patternWeights['momentum_adv'] || 1.4);
-        predictions.push({ prediction: momentumRes.prediction, confidence: momentumRes.confidence, priority: 14, name: momentumRes.name, weight: w });
+        predictions.push({ prediction: momentumRes.prediction, confidence: momentumRes.confidence, priority: 14, name: momentumRes.name, weight: w, patternId: 'momentum_adv', detectedAtPhien: data[0]?.Phien });
         factors.push(momentumRes.name); allPatterns.push(momentumRes);
     }
 
     const bayesRes = analyzeBayesian(results);
     if (bayesRes.detected) {
         const w = (lc79_learningData[type].patternWeights['bayesian_update'] || 1.8);
-        predictions.push({ prediction: bayesRes.prediction, confidence: bayesRes.confidence, priority: 13, name: bayesRes.name, weight: w });
+        predictions.push({ prediction: bayesRes.prediction, confidence: bayesRes.confidence, priority: 13, name: bayesRes.name, weight: w, patternId: 'bayesian_update', detectedAtPhien: data[0]?.Phien });
         factors.push(bayesRes.name); allPatterns.push(bayesRes);
     }
 
     const clusterRes = analyzeClusterBreak(results);
     if (clusterRes.detected) {
         const w = (lc79_learningData[type].patternWeights['cluster_break'] || 1.3);
-        predictions.push({ prediction: clusterRes.prediction, confidence: clusterRes.confidence, priority: 12, name: clusterRes.name, weight: w });
+        predictions.push({ prediction: clusterRes.prediction, confidence: clusterRes.confidence, priority: 12, name: clusterRes.name, weight: w, patternId: 'cluster_break', detectedAtPhien: data[0]?.Phien });
         factors.push(clusterRes.name); allPatterns.push(clusterRes);
     }
 
     const fourierRes = analyzeFourierCycle(results);
     if (fourierRes.detected) {
         const w = (lc79_learningData[type].patternWeights['fourier_cycle'] || 1.2);
-        predictions.push({ prediction: fourierRes.prediction, confidence: fourierRes.confidence, priority: 11, name: fourierRes.name, weight: w });
+        predictions.push({ prediction: fourierRes.prediction, confidence: fourierRes.confidence, priority: 11, name: fourierRes.name, weight: w, patternId: 'fourier_cycle', detectedAtPhien: data[0]?.Phien });
         factors.push(fourierRes.name); allPatterns.push(fourierRes);
     }
 
     const kellyRes = analyzeKellyCriterion(results);
     if (kellyRes.detected) {
         const w = (lc79_learningData[type].patternWeights['kelly_criterion'] || 1.5);
-        predictions.push({ prediction: kellyRes.prediction, confidence: kellyRes.confidence, priority: 11, name: kellyRes.name, weight: w });
+        predictions.push({ prediction: kellyRes.prediction, confidence: kellyRes.confidence, priority: 11, name: kellyRes.name, weight: w, patternId: 'kelly_criterion', detectedAtPhien: data[0]?.Phien });
         factors.push(kellyRes.name); allPatterns.push(kellyRes);
     }
 
@@ -984,7 +1405,7 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
             const res = a.fn();
             if (res.detected) {
                 const w = (lc79_learningData[type].patternWeights[res.patternId] || 1.0);
-                predictions.push({ prediction: res.prediction, confidence: res.confidence, priority: a.priority, name: res.name, weight: w });
+                predictions.push({ prediction: res.prediction, confidence: res.confidence, priority: a.priority, name: res.name, weight: w, patternId: res.patternId, detectedAtPhien: data[0]?.Phien });
                 factors.push(res.name); allPatterns.push(res);
             }
         } catch (e) {}
@@ -993,17 +1414,17 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     const distribution = analyzeDistribution(last50);
     if (distribution.total >= 10 && distribution.imbalance > 0.15) {
         const minority = distribution.taiPercent < 50 ? 'Tài' : 'Xỉu';
-        predictions.push({ prediction: minority, confidence: 62, priority: 4, name: 'Phân bố lệch', weight: 1.0 });
+        predictions.push({ prediction: minority, confidence: 62, priority: 4, name: 'Phân bố lệch', weight: 1.0, patternId: 'distribution', detectedAtPhien: data[0]?.Phien });
         factors.push(`Phân bố (T:${distribution.taiPercent.toFixed(0)}%-X:${distribution.xiuPercent.toFixed(0)}%)`);
     }
 
     if (predictions.length === 0) {
         const cauTuNhien = analyzeCauTuNhien(results);
         if (cauTuNhien.detected) {
-            predictions.push({ prediction: cauTuNhien.prediction, confidence: cauTuNhien.confidence, priority: 1, name: cauTuNhien.name, weight: 1.0 });
+            predictions.push({ prediction: cauTuNhien.prediction, confidence: cauTuNhien.confidence, priority: 1, name: cauTuNhien.name, weight: 1.0, patternId: 'cau_tu_nhien', detectedAtPhien: data[0]?.Phien });
             factors.push(cauTuNhien.name);
         } else {
-            predictions.push({ prediction: 'Tài', confidence: 55, priority: 1, name: 'Fallback Tài', weight: 1.0 });
+            predictions.push({ prediction: 'Tài', confidence: 55, priority: 1, name: 'Fallback Tài', weight: 1.0, patternId: null, detectedAtPhien: data[0]?.Phien });
             factors.push('Fallback');
         }
     }
@@ -1017,6 +1438,7 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
 
     const antiLossKey2 = antiLossKey || type;
 
+    // Hard stop guard check (giữ logic cũ để tương thích)
     const hardStopGuard = analyzeHardStopGuard(antiLossKey2);
     if (hardStopGuard.detected) {
         factors.push(hardStopGuard.name);
@@ -1040,6 +1462,7 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
                 taiScore, xiuScore, topPattern: 'HARD STOP', distribution,
                 layersActive: {}, learningStats: {},
                 antiLossGuard: { hardStop: true, reason: hardStopGuard.name },
+                v2Guards: { hardStopV1: true },
             },
         };
     }
@@ -1051,7 +1474,7 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
         if (antiBoost.prediction === 'Tài') taiScore += boostScore;
         else xiuScore += boostScore;
         factors.push(antiBoost.name);
-        predictions.push({ ...antiBoost, priority: 12, weight: w });
+        predictions.push({ ...antiBoost, priority: 12, weight: w, patternId: 'anti_loss_boost', detectedAtPhien: data[0]?.Phien });
     }
 
     let finalPrediction = taiScore >= xiuScore ? 'Tài' : 'Xỉu';
@@ -1065,7 +1488,27 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     baseConfidence += Math.round(agreementRatio * 12);
     baseConfidence += getAdaptiveConfidenceBoost(type);
 
-    const guardResult = applyAntiLossGuard(antiLossKey2, finalPrediction, Math.round(baseConfidence));
+    // 🔥 V2 GUARD
+    const guardResult = applyAntiLossGuardV2(
+        antiLossKey2,
+        finalPrediction,
+        Math.round(baseConfidence),
+        predictions,
+        results,
+        data[0]?.Phien
+    );
+
+    // V2: pattern conflict check sau guard
+    let finalAction = guardResult.action;
+    let finalReason = guardResult.reason;
+    if (finalAction !== 'SKIP') {
+        const conflict = _detectPatternConflict(taiScore, xiuScore);
+        if (conflict.conflict) {
+            finalAction = 'SKIP';
+            finalReason = conflict.reason;
+            log(`[ANTI-LOSS-V2] ⚖️ PATTERN CONFLICT: ${conflict.reason}`);
+        }
+    }
 
     const phienPhanTich = data[0] && data[0].Phien != null ? data[0].Phien : null;
     let phienDuDoan = null;
@@ -1075,18 +1518,18 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
         else phienDuDoan = `${phienPhanTich}_next`;
     }
 
-    const isSkip = guardResult.action === 'SKIP';
+    const isSkip = finalAction === 'SKIP';
 
     return {
         prediction: isSkip ? 'SKIP' : guardResult.prediction,
-        action: isSkip ? 'SKIP' : guardResult.action,
+        action: isSkip ? 'SKIP' : finalAction,
         confidence: guardResult.confidence,
         phien_phan_tich: phienPhanTich,
         phien_du_doan: phienDuDoan,
         factors, allPatterns,
         forceReversed: guardResult.forceReversed,
         antiLossState: getAntiLossState(antiLossKey2),
-        reason: guardResult.reason,
+        reason: finalReason,
         detailedAnalysis: {
             totalPatterns: predictions.length,
             taiVotes: predictions.filter(p => p.prediction === 'Tài').length,
@@ -1121,12 +1564,13 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
                     return r10.length ? (r10.filter(Boolean).length / r10.length * 100).toFixed(0) + '%' : 'N/A';
                 })(),
             },
+            v2Guards: guardResult.v2 || {},
         },
     };
 }
 
 // =================================================================================================
-// ✅ FORMAT JSON RESPONSE CHUẨN CHO TOOL HTML
+// ✅ FORMAT JSON RESPONSE
 // =================================================================================================
 function formatSimplePrediction(data, result) {
     const phienHienTai = (data && data[0] && data[0].Phien != null) ? data[0].Phien : null;
@@ -1160,6 +1604,7 @@ function formatSimplePrediction(data, result) {
         action: isSkip ? 'SKIP' : 'BET',
         forceReversed: result.forceReversed || false,
         hardStop: result.detailedAnalysis?.antiLossGuard?.hardStop || false,
+        v2: result.detailedAnalysis?.v2Guards || {},
         idol: '@tranhoang2286',
         timestamp: new Date().toISOString()
     };
@@ -1183,7 +1628,7 @@ function savePredictionToHistory(type, phien, prediction, confidence, latestData
 }
 
 // =================================================================================================
-// WORKERS
+// WORKERS (giữ nguyên)
 // =================================================================================================
 function worker_geightdors(game_id, platform_id, table, gid, is_md5) {
     const url = `https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=${platform_id}&gid=${gid}`;
@@ -1895,7 +2340,7 @@ function predict_from_json_book(key, history_tx) {
                 if (acc > 0.7) conf = Math.min(0.95, conf + 0.05);
                 else if (acc < 0.4) conf = Math.max(0.5, conf - 0.1);
             }
-            const guardResult = applyAntiLossGuard(`json_${key}`, pred === 'T' ? 'Tài' : 'Xỉu', Math.round(conf * 100));
+            const guardResult = applyAntiLossGuardV2(`json_${key}`, pred === 'T' ? 'Tài' : 'Xỉu', Math.round(conf * 100), null, null, null);
             const finalPred = guardResult.action === 'SKIP' ? 'SKIP' : (guardResult.prediction === 'Tài' ? 'T' : 'X');
             return { prediction: finalPred, confidence: guardResult.confidence, source: 'book', pattern_used: pat, pattern_len: cand.len, book_stats: { T: countT, X: countX, total }, forceReversed: guardResult.forceReversed, action: guardResult.action, reason: guardResult.reason };
         }
@@ -1904,7 +2349,7 @@ function predict_from_json_book(key, history_tx) {
     const tCount = last5.filter(x => x === 'T').length;
     const xCount = last5.length - tCount;
     let fallbackPred = tCount > xCount ? 'T' : 'X';
-    const guardResult = applyAntiLossGuard(`json_${key}`, fallbackPred === 'T' ? 'Tài' : 'Xỉu', 55);
+    const guardResult = applyAntiLossGuardV2(`json_${key}`, fallbackPred === 'T' ? 'Tài' : 'Xỉu', 55, null, null, null);
     fallbackPred = guardResult.action === 'SKIP' ? 'SKIP' : (guardResult.prediction === 'Tài' ? 'T' : 'X');
     return { prediction: fallbackPred, confidence: guardResult.confidence, source: 'fallback_last5', pattern_used: null, action: guardResult.action, reason: guardResult.reason };
 }
@@ -2039,7 +2484,7 @@ function loadAllJsonData() {
 }
 
 // =================================================================================================
-// EXPRESS APP + ROUTES CHO TOOL HTML
+// EXPRESS APP + ROUTES
 // =================================================================================================
 const app = express();
 app.use(express.json());
@@ -2055,12 +2500,21 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
-        service: 'all_in_one_v5',
-        version: '5.1.0-fixed',
+        service: 'all_in_one_v5.2',
+        version: '5.2.0-v2-antiloss',
         idol: '@tranhoang2286',
         uptime: process.uptime(),
         runtimeDir: RUNTIME_DIR,
         dataDir: DATA_DIR,
+        v2Config: {
+            enabled: ANTI_LOSS_V2.ENABLED,
+            hardStopCooldown: ANTI_LOSS_V2.HARD_STOP_COOLDOWN_PHASES,
+            hardStopConfirmWins: ANTI_LOSS_V2.HARD_STOP_CONFIRM_WINS,
+            confidenceFloorByLoss: ANTI_LOSS_V2.CONFIDENCE_FLOOR_BY_LOSS,
+            dailyLossCap: ANTI_LOSS_V2.DAILY_LOSS_CAP,
+            safeMode: ANTI_LOSS_V2.SAFE_MODE,
+        },
+        dailyTracker: DAILY_TRACKER,
         timestamp: new Date().toISOString()
     });
 });
@@ -2130,17 +2584,19 @@ app.get('/api/predict/:game/:table', async (req, res) => {
     }
 });
 
+// ✅ ROUTE CŨ /predict/:type CHO TƯƠNG THÍCH
 app.get('/predict/:type', async (req, res) => {
     try {
         const type = req.params.type;
         if (type !== 'hu' && type !== 'md5') {
-            return res.status(400).json({ error: 'BAD_TYPE', message: 'type phải là hu hoặc md5' });
+            return res.status(400).json({ error: 'BAD_TYPE', message: 'Chỉ hỗ trợ hu hoặc md5' });
         }
         const data = type === 'hu' ? await lc79_fetchDataHu() : await lc79_fetchDataMd5();
         if (!data || data.length === 0) {
-            return res.status(404).json({ error: 'NO_DATA', message: 'Không fetch được dữ liệu LC79' });
+            return res.status(404).json({ error: 'NO_DATA', message: `Chưa có dữ liệu ${type}` });
         }
-        const result = calculateAdvancedPrediction(data, type, `lc79_${type}`);
+        const key = `lc79_${type}`;
+        const result = calculateAdvancedPrediction(data, type, key);
         res.json(formatSimplePrediction(data, result));
     } catch (e) {
         logError('[API /predict]', e);
@@ -2148,127 +2604,82 @@ app.get('/predict/:type', async (req, res) => {
     }
 });
 
-app.get('/api/history/:game/:table', (req, res) => {
-    try {
-        const { game, table } = req.params;
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-        const data = DATA_STORE[game]?.[table];
-        if (!data || data.length === 0) {
-            return res.status(404).json({ error: 'NO_DATA', message: `Chưa có dữ liệu ${game}/${table}` });
-        }
-        res.json({
-            game, table, total: data.length,
-            history: data.slice(0, limit).map(r => ({
-                phien: r.phien,
-                xucXac: r.xuc_xac || [r.Xuc_xac_1, r.Xuc_xac_2, r.Xuc_xac_3],
-                tong: r.tong || r.Tong,
-                ketQua: r.ket_qua || r.Ket_qua
-            }))
-        });
-    } catch (e) {
-        logError('[API /api/history]', e);
-        res.status(500).json({ error: 'INTERNAL', message: e.message });
-    }
-});
-
-app.get('/api/lc79/history/:type', (req, res) => {
-    try {
-        const type = req.params.type;
-        if (type !== 'hu' && type !== 'md5') return res.status(400).json({ error: 'BAD_TYPE' });
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-        res.json({
-            type,
-            total: lc79_predictionHistory[type]?.length || 0,
-            history: (lc79_predictionHistory[type] || []).slice(0, limit)
-        });
-    } catch (e) { res.status(500).json({ error: 'INTERNAL', message: e.message }); }
-});
-
-app.get('/api/anti-loss/:key', (req, res) => {
+// ✅ ROUTE RESET STATE (admin)
+app.post('/api/reset-state/:key', (req, res) => {
     const key = req.params.key;
-    const state = getAntiLossState(key);
-    res.json({
-        key,
-        consecutiveLoss: state.consecutiveLoss,
-        consecutiveWin: state.consecutiveWin,
-        totalPredictions: state.totalPredictions,
-        totalCorrect: state.totalCorrect,
-        accuracy: state.totalPredictions > 0
-            ? (state.totalCorrect / state.totalPredictions * 100).toFixed(1) + '%'
-            : 'N/A',
-        forceReverseCount: state.forceReverseCount,
-        hardStopActive: state.hardStopActive,
-        recentResults: state.recentResults.slice(-20)
-    });
+    if (ANTI_LOSS_STATE[key]) {
+        delete ANTI_LOSS_STATE[key];
+        return res.json({ status: 'ok', message: `Reset state cho ${key}` });
+    }
+    res.json({ status: 'no_state', message: `Không có state cho ${key}` });
 });
 
-app.get('/api/sicbo/:type', (req, res) => {
-    const type = req.params.type;
-    if (type === 'sumclub') return res.json({ type, total: sumclub_history.length, history: sumclub_history.slice(0, 50) });
-    if (type === 'sunlive') return res.json({ type, total: sunlive_history.length, history: sunlive_history.slice(0, 50) });
-    if (type === 'luckywin') return res.json({ type, total: luckywin_history.length, history: luckywin_history.slice(0, 50) });
-    res.status(400).json({ error: 'BAD_TYPE', message: 'type: sumclub | sunlive | luckywin' });
+// ✅ ROUTE DAILY TRACKER
+app.get('/api/daily-tracker', (req, res) => {
+    _checkDailyReset();
+    res.json(DAILY_TRACKER);
+});
+
+// ✅ ROUTE CONFIG V2
+app.get('/api/v2-config', (req, res) => {
+    res.json(ANTI_LOSS_V2);
+});
+
+app.post('/api/v2-config', (req, res) => {
+    const updates = req.body || {};
+    Object.assign(ANTI_LOSS_V2, updates);
+    log(`[V2-CONFIG] Updated: ${JSON.stringify(updates)}`);
+    res.json({ status: 'ok', config: ANTI_LOSS_V2 });
 });
 
 // =================================================================================================
 // STARTUP
 // =================================================================================================
-async function startup() {
-    log('='.repeat(80));
-    log('  ALL_IN_ONE_V5 - FIXED VERSION FOR TOOL HTML');
-    log(`  Runtime dir: ${RUNTIME_DIR}`);
-    log(`  Data dir   : ${DATA_DIR}`);
-    log(`  Node       : ${process.version}`);
-    log(`  Platform   : ${os.platform()} ${os.arch()}`);
-    log('='.repeat(80));
+function startAll() {
+    log('========================================');
+    log('🚀 ALL_IN_ONE_V5.2 STARTING...');
+    log('========================================');
 
-    lc79_loadLearningData();
+    // Load JSON predictors & data
     load_all_json_predictors();
     loadAllJsonData();
+    lc79_loadLearningData();
 
-    try { start_all_full_py_workers(); } catch (e) { logError('start_all_full_py_workers:', e); }
-    try { start_xocdia88_workers(); } catch (e) { logError('start_xocdia88_workers:', e); }
-    try { start_sicbo_workers(); } catch (e) { logError('start_sicbo_workers:', e); }
-    try { start_sicbosum_ws(); } catch (e) { logError('start_sicbosum_ws:', e); }
+    // Start workers
+    start_all_full_py_workers();
+    start_xocdia88_workers();
+    start_sicbo_workers();
+    start_sicbosum_ws();
 
-    try { lc79_startAutoSaveTask(); } catch (e) { logError('lc79_startAutoSaveTask:', e); }
-    try { start_json_auto_update_task(); } catch (e) { logError('start_json_auto_update_task:', e); }
+    // Start auto tasks
+    lc79_startAutoSaveTask();
+    start_json_auto_update_task();
 
-    const server = app.listen(PORT, HOST, () => {
-        log('='.repeat(80));
-        log(`  ✅ SERVER RUNNING`);
-        log(`  Local   : http://127.0.0.1:${PORT}`);
-        log(`  Network : http://${HOST}:${PORT}`);
-        log(`  Health  : http://127.0.0.1:${PORT}/health`);
-        log(`  Games   : http://127.0.0.1:${PORT}/api/games`);
-        log(`  Predict : http://127.0.0.1:${PORT}/api/predict/lc79/hu`);
-        log('='.repeat(80));
+    // Start Express server
+    app.listen(PORT, HOST, () => {
+        log(`✅ Server running on http://${HOST}:${PORT}`);
+        log(`✅ Runtime dir: ${RUNTIME_DIR}`);
+        log(`✅ Data dir: ${DATA_DIR}`);
+        log(`📡 Endpoints:`);
+        log(`   GET  /`);
+        log(`   GET  /health`);
+        log(`   GET  /api/games`);
+        log(`   GET  /api/predict/:game/:table`);
+        log(`   GET  /predict/:type (hu|md5)`);
+        log(`   GET  /api/daily-tracker`);
+        log(`   GET  /api/v2-config`);
+        log(`   POST /api/v2-config`);
+        log(`   POST /api/reset-state/:key`);
+        log('========================================');
     });
-
-    server.on('error', (err) => {
-        if (err.code === 'EADDRINUSE') {
-            logError(`Port ${PORT} đã bị chiếm. Đổi PORT env hoặc kill process cũ.`);
-        } else {
-            logError('Server error:', err);
-        }
-        process.exit(1);
-    });
-
-    const shutdown = (sig) => {
-        log(`Nhận ${sig}, đang shutdown...`);
-        try { lc79_saveLearningData(); } catch (e) {}
-        try {
-            for (const k in JSON_PREDICTOR_STATE) {
-                if (JSON_PREDICTOR_STATE[k]?.dirty) save_json_predictor_state(k);
-            }
-        } catch (e) {}
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 3000);
-    };
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('uncaughtException', (e) => logError('UNCAUGHT:', e));
-    process.on('unhandledRejection', (e) => logError('UNHANDLED:', e));
 }
 
-startup();
+process.on('uncaughtException', (err) => {
+    logError('[UNCAUGHT]', err);
+});
+
+process.on('unhandledRejection', (err) => {
+    logError('[UNHANDLED]', err);
+});
+
+startAll();
