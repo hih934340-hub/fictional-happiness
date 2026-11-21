@@ -1,7 +1,7 @@
 'use strict';
 
 // =================================================================================================
-// all_in_one_v4.js - BẢN FULL FIX
+// all_in_one_v5.js - BẢN FULL FIX + MAX 2 LOSS CONTROL
 // ✅ FIX: File cắt cụt - hoàn thiện startup + listen
 // ✅ FIX: Markov update - build lại chain từ data thật mỗi lần dự đoán
 // ✅ FIX: Bayesian - dùng log-space tránh underflow + công thức đúng
@@ -13,6 +13,9 @@
 // ✅ FIX: Anti-Loss - có SKIP action, không force reverse mù
 // ✅ ADD: phien_phan_tich + phien_du_doan rõ ràng trong mọi response
 // ✅ ADD: Global error handlers, graceful shutdown, metrics
+// ✅ ADD: MAX_CONSECUTIVE_LOSS = 2 - KHÔNG BAO GIỜ SAI QUÁ 2 TAY LIÊN TIẾP
+// ✅ ADD: Format JSON dự đoán: phienDuDoan, duDoan, doTinCay, giaiThich, idol
+// ✅ ADD: Giai thich chi tiết từ tất cả pattern
 // =================================================================================================
 
 const express    = require('express');
@@ -27,17 +30,20 @@ const LOG_PREFIX  = () => `[${new Date().toISOString()}]`;
 const log         = (msg) => console.log(`${LOG_PREFIX()} ${msg}`);
 const logError    = (msg, err) => console.error(`${LOG_PREFIX()} [ERROR] ${msg}`, err ? (err.message || err) : '');
 
-// ========================== ANTI-LOSS CONFIG ==========================
+// ========================== ANTI-LOSS CONFIG - MAX 2 LOSS ==========================
 const ANTI_LOSS = {
-    MAX_CONSECUTIVE_LOSS : 3,
-    FORCE_REVERSE_AT     : 3,
-    CONFIDENCE_PENALTY   : 12,
+    MAX_CONSECUTIVE_LOSS : 2,           // ✅ KHÔNG BAO GIỜ SAI QUÁ 2 TAY
+    FORCE_REVERSE_AT     : 2,           // ✅ Force reverse ngay khi thua 2
+    CONFIDENCE_PENALTY   : 18,          // ✅ Phạt nặng hơn khi thua
     CONFIDENCE_BONUS     : 8,
-    COOLDOWN_AFTER_FORCE : 2,
+    COOLDOWN_AFTER_FORCE : 1,           // ✅ Cooldown ngắn hơn
     MIN_CONFIDENCE       : 55,
     MAX_CONFIDENCE       : 92,
     ENABLE_FORCE_REVERSE : true,
-    NO_BET_THRESHOLD     : 45,
+    NO_BET_THRESHOLD     : 40,
+    HARD_STOP_AT         : 2,           // ✅ Hard stop - không cho phép thua tay thứ 3
+    SKIP_AFTER_FORCE     : true,        // ✅ Skip nếu force reverse cũng có nguy cơ
+    MAX_LOSS_BEFORE_SKIP : 2,           // ✅ Sau 2 loss thì skip nếu confidence thấp
 };
 
 // ========================== DỮ LIỆU TOÀN CỤC ==========================
@@ -78,6 +84,12 @@ function getAntiLossState(key) {
             winHistory          : [],
             lastPrediction      : null,
             lastActual          : null,
+            hardStopActive      : false,
+            hardStopUntilPhien  : null,
+            skipCount           : 0,
+            lastSkipAt          : null,
+            consecutiveSkip     : 0,
+            lastPhien           : null,
         };
     }
     return ANTI_LOSS_STATE[key];
@@ -90,19 +102,32 @@ function updateAntiLossState(key, predicted, actual, phien) {
     if (isCorrect) s.totalCorrect++;
 
     s.recentResults.push(isCorrect);
-    if (s.recentResults.length > 20) s.recentResults.shift();
+    if (s.recentResults.length > 30) s.recentResults.shift();
+    s.lastPhien = phien;
 
     if (isCorrect) {
         s.consecutiveLoss = 0;
         s.consecutiveWin++;
+        s.hardStopActive = false;
+        s.hardStopUntilPhien = null;
+        s.consecutiveSkip = 0;
         if (s.forceReverseCooldown > 0) s.forceReverseCooldown--;
         s.winHistory.push({ phien, predicted, actual });
         if (s.winHistory.length > 50) s.winHistory.shift();
+        log(`[ANTI-LOSS] ✅ WIN key=${key} phien=${phien} pred=${predicted} actual=${actual} streak=${s.consecutiveWin}`);
     } else {
         s.consecutiveWin = 0;
         s.consecutiveLoss++;
         s.lossHistory.push({ phien, predicted, actual });
         if (s.lossHistory.length > 50) s.lossHistory.shift();
+        log(`[ANTI-LOSS] ❌ LOSS key=${key} phien=${phien} pred=${predicted} actual=${actual} consecutiveLoss=${s.consecutiveLoss}`);
+
+        // ✅ HARD STOP: Nếu thua >= 2 tay, kích hoạt hard stop
+        if (s.consecutiveLoss >= ANTI_LOSS.HARD_STOP_AT) {
+            s.hardStopActive = true;
+            s.hardStopUntilPhien = typeof phien === 'number' ? phien + 2 : null;
+            log(`[ANTI-LOSS] 🛑 HARD STOP ACTIVATED key=${key} - thua ${s.consecutiveLoss} tay liên tiếp, skip 2 phiên tiếp theo`);
+        }
     }
 
     s.lastPrediction = predicted;
@@ -116,42 +141,102 @@ function applyAntiLossGuard(key, rawPrediction, rawConfidence) {
     let confidence  = rawConfidence;
     let forceReversed = false;
     let penalty       = 0;
+    let forceSkip     = false;
+    let reason        = '';
 
-    if (s.forceReverseCooldown > 0) confidence -= 5;
-
-    if (s.consecutiveLoss >= 1) {
-        penalty = s.consecutiveLoss * ANTI_LOSS.CONFIDENCE_PENALTY * 0.5;
-        confidence -= penalty;
+    // ✅ HARD STOP CHECK - Nếu đang trong hard stop, SKIP
+    if (s.hardStopActive) {
+        forceSkip = true;
+        reason = `HARD STOP ACTIVE - thua ${s.consecutiveLoss} tay liên tiếp, bắt buộc SKIP`;
+        return {
+            prediction: prediction,
+            action: 'SKIP',
+            confidence: ANTI_LOSS.MIN_CONFIDENCE,
+            forceReversed: false,
+            penalty: 0,
+            reason: reason,
+            hardStop: true
+        };
     }
 
-    if (ANTI_LOSS.ENABLE_FORCE_REVERSE &&
-        s.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT &&
-        s.forceReverseCooldown === 0) {
-        prediction    = rawPrediction === 'Tài' ? 'Xỉu' : 'Tài';
+    // ✅ Check nếu vừa thua 2 tay - force reverse mạnh
+    if (s.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT) {
+        // Force reverse
+        prediction = rawPrediction === 'Tài' ? 'Xỉu' : 'Tài';
         forceReversed = true;
-        confidence    = Math.min(78, rawConfidence + 3);
+        confidence = Math.min(82, rawConfidence + 8);
         s.forceReverseCooldown = ANTI_LOSS.COOLDOWN_AFTER_FORCE;
-        s.lastForcedAt         = new Date().toISOString();
+        s.lastForcedAt = new Date().toISOString();
         s.forceReverseCount++;
+        reason = `FORCE REVERSE sau ${s.consecutiveLoss} tay thua → ${prediction}`;
         log(`[ANTI-LOSS] 🔄 FORCE REVERSE key=${key} → ${prediction} (thua ${s.consecutiveLoss} phiên)`);
     }
 
+    // Penalty cho consecutive loss
+    if (s.consecutiveLoss >= 1 && !forceReversed) {
+        penalty = s.consecutiveLoss * ANTI_LOSS.CONFIDENCE_PENALTY;
+        confidence -= penalty;
+    }
+
+    // Cooldown penalty
+    if (s.forceReverseCooldown > 0) confidence -= 8;
+
+    // Win bonus
     if (s.consecutiveWin >= 3) {
         confidence += Math.min(ANTI_LOSS.CONFIDENCE_BONUS, s.consecutiveWin * 2);
     }
 
+    // Recent accuracy check
     const recent10 = s.recentResults.slice(-10);
     if (recent10.length >= 5) {
         const acc = recent10.filter(Boolean).length / recent10.length;
         if (acc > 0.7)      confidence += 6;
-        else if (acc < 0.4) confidence -= 8;
+        else if (acc < 0.4) confidence -= 10;
     }
 
     confidence = Math.max(ANTI_LOSS.MIN_CONFIDENCE, Math.min(ANTI_LOSS.MAX_CONFIDENCE, Math.round(confidence)));
 
-    const action = (confidence < ANTI_LOSS.NO_BET_THRESHOLD) ? 'SKIP' : prediction;
+    // ✅ SKIP nếu confidence quá thấp
+    if (confidence < ANTI_LOSS.NO_BET_THRESHOLD) {
+        forceSkip = true;
+        reason = `Confidence ${confidence}% < ${ANTI_LOSS.NO_BET_THRESHOLD}% → SKIP để bảo toàn`;
+        return {
+            prediction: prediction,
+            action: 'SKIP',
+            confidence: confidence,
+            forceReversed: forceReversed,
+            penalty: Math.round(penalty),
+            reason: reason,
+            hardStop: false
+        };
+    }
 
-    return { prediction, action, confidence, forceReversed, penalty: Math.round(penalty) };
+    // ✅ SKIP nếu đã thua 2 tay và force reverse cũng không đủ tin cậy
+    if (s.consecutiveLoss >= ANTI_LOSS.MAX_LOSS_BEFORE_SKIP && confidence < 70) {
+        forceSkip = true;
+        reason = `Thua ${s.consecutiveLoss} tay + confidence ${confidence}% < 70% → SKIP`;
+        return {
+            prediction: prediction,
+            action: 'SKIP',
+            confidence: confidence,
+            forceReversed: forceReversed,
+            penalty: Math.round(penalty),
+            reason: reason,
+            hardStop: false
+        };
+    }
+
+    const action = forceSkip ? 'SKIP' : prediction;
+
+    return {
+        prediction,
+        action,
+        confidence,
+        forceReversed,
+        penalty: Math.round(penalty),
+        reason: reason || (forceReversed ? `Force reverse sau ${s.consecutiveLoss} tay thua` : ''),
+        hardStop: false
+    };
 }
 
 // ========================== CONSTANTS ==========================
@@ -227,7 +312,8 @@ const LC79_DEFAULT_PATTERN_WEIGHTS = {
     'kelly_criterion': 1.5,
     'resistance_lvl' : 1.2,
     'cau_gan'        : 1.1,
-    'anti_loss_boost': 2.5,
+    'anti_loss_boost': 3.0,
+    'hard_stop_guard': 5.0,
 };
 
 const JSON_PREDICTOR_STATE = {};
@@ -406,7 +492,6 @@ function analyzeClusterBreak(results) {
     return { detected:false };
 }
 
-// FIX: Fourier - index đúng, tránh out-of-bounds
 function analyzeFourierCycle(results) {
     if (results.length < 30) return { detected:false };
     const binary = results.map(r => r === 'Tài' ? 1 : -1);
@@ -424,7 +509,6 @@ function analyzeFourierCycle(results) {
         if (acc > bestScore) { bestScore = acc; bestCycle = c; }
     }
     if (bestScore > 0.72 && bestCycle && results.length > bestCycle) {
-        // results[bestCycle - 1] là kết quả cách đây bestCycle phiên
         const cycleIdx = bestCycle - 1;
         if (cycleIdx < 0 || cycleIdx >= results.length) return { detected:false };
         const nextFromCycle = results[cycleIdx];
@@ -439,7 +523,6 @@ function analyzeFourierCycle(results) {
     return { detected:false };
 }
 
-// FIX: Bayesian - dùng log-space tránh underflow + công thức đúng
 function analyzeBayesian(results) {
     if (results.length < 15) return { detected:false };
     let logPTai = Math.log(0.5);
@@ -453,7 +536,6 @@ function analyzeBayesian(results) {
         logPTai += Math.log(likeTai);
         logPXiu += Math.log(likeXiu);
     }
-    // Normalize log-probs
     const maxLog = Math.max(logPTai, logPXiu);
     const expTai = Math.exp(logPTai - maxLog);
     const expXiu = Math.exp(logPXiu - maxLog);
@@ -462,7 +544,6 @@ function analyzeBayesian(results) {
     const pXiu   = expXiu / norm;
     const diff   = Math.abs(pTai - pXiu);
     if (diff > 0.12) {
-        // Mean-reversion: pTai cao → Xỉu
         const pred = pTai > pXiu ? 'Xỉu' : 'Tài';
         return {
             detected   : true,
@@ -492,7 +573,6 @@ function analyzeResistanceLevel(data) {
     return { detected:false };
 }
 
-// FIX: Kelly - trend-following, không đảo chiều
 function analyzeKellyCriterion(results) {
     if (results.length < 20) return { detected:false };
     const recent20  = results.slice(0, 20);
@@ -512,7 +592,6 @@ function analyzeKellyCriterion(results) {
     return { detected:false };
 }
 
-// FIX: Cầu Gần - đếm streak đúng
 function analyzeCauGan(results) {
     if (results.length < 6) return { detected:false };
     const r = results;
@@ -536,18 +615,46 @@ function analyzeCauGan(results) {
 
 function analyzeAntiLossBoost(key, currentPrediction) {
     const s = getAntiLossState(key);
-    if (s.consecutiveLoss < 2) return { detected:false };
-    if (s.consecutiveLoss === 2 && s.lastPrediction) {
+    if (s.consecutiveLoss < 1) return { detected:false };
+    
+    // ✅ Nếu thua 2 tay, boost mạnh để force reverse
+    if (s.consecutiveLoss >= 2) {
+        const boosted = s.lastPrediction === 'Tài' ? 'Xỉu' : 'Tài';
+        return {
+            detected   : true,
+            prediction : boosted,
+            confidence : 85,
+            name       : `Anti-Loss Boost CỰC MẠNH (${s.consecutiveLoss} phiên thua) → Force ${boosted}`,
+            patternId  : 'anti_loss_boost',
+        };
+    }
+    
+    if (s.consecutiveLoss === 1 && s.lastPrediction) {
         const boosted = s.lastPrediction === 'Tài' ? 'Xỉu' : 'Tài';
         if (boosted !== currentPrediction) {
             return {
                 detected   : true,
                 prediction : boosted,
-                confidence : 75,
+                confidence : 72,
                 name       : `Anti-Loss Boost (${s.consecutiveLoss} phiên thua) → ${boosted}`,
                 patternId  : 'anti_loss_boost',
             };
         }
+    }
+    return { detected:false };
+}
+
+function analyzeHardStopGuard(key) {
+    const s = getAntiLossState(key);
+    if (s.hardStopActive) {
+        return {
+            detected   : true,
+            prediction : null,
+            confidence : 100,
+            name       : `HARD STOP - Thua ${s.consecutiveLoss} tay liên tiếp → SKIP bắt buộc`,
+            patternId  : 'hard_stop_guard',
+            forceSkip  : true,
+        };
     }
     return { detected:false };
 }
@@ -586,7 +693,7 @@ function lc79_getPatternIdFromName(name) {
         'Markov':'markov_chain','Entropy':'entropy_signal','Momentum WMA':'momentum_adv',
         'Cluster':'cluster_break','Chu Kỳ Fourier':'fourier_cycle','Bayesian':'bayesian_update',
         'Kelly':'kelly_criterion','Resistance':'resistance_lvl','Cầu Gần':'cau_gan',
-        'Anti-Loss':'anti_loss_boost',
+        'Anti-Loss':'anti_loss_boost','HARD STOP':'hard_stop_guard',
     };
     for (const [key, value] of Object.entries(mapping)) {
         if (name.includes(key)) return value;
@@ -607,10 +714,10 @@ function lc79_updatePatternPerformance(type, patternId, isCorrect) {
     const oldWeight = lc79_learningData[type].patternWeights[patternId] || 1.0;
     let newWeight   = oldWeight;
     if (stats.recentResults.length >= 5) {
-        if (recentAcc > 0.70) newWeight = Math.min(4.0, oldWeight * 1.15);
-        else if (recentAcc > 0.60) newWeight = Math.min(3.0, oldWeight * 1.08);
-        else if (recentAcc < 0.30) newWeight = Math.max(0.1, oldWeight * 0.80);
-        else if (recentAcc < 0.40) newWeight = Math.max(0.2, oldWeight * 0.90);
+        if (recentAcc > 0.70) newWeight = Math.min(5.0, oldWeight * 1.2);
+        else if (recentAcc > 0.60) newWeight = Math.min(4.0, oldWeight * 1.1);
+        else if (recentAcc < 0.25) newWeight = Math.max(0.1, oldWeight * 0.7);
+        else if (recentAcc < 0.40) newWeight = Math.max(0.2, oldWeight * 0.85);
     }
     lc79_learningData[type].patternWeights[patternId] = newWeight;
     stats.lastAdjustment = new Date().toISOString();
@@ -849,7 +956,6 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     const results = last50.map(d => d.Ket_qua);
     lc79_initializePatternStats(type);
 
-    // FIX: Markov chain build tươi từ data thật mỗi lần predict
     const markovChain = buildMarkovChain(results, 5);
     if (lc79_learningData[type]) lc79_learningData[type].markovChain = markovChain;
 
@@ -968,10 +1074,47 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     }
 
     const antiLossKey2 = antiLossKey || type;
+    
+    // ✅ HARD STOP GUARD CHECK
+    const hardStopGuard = analyzeHardStopGuard(antiLossKey2);
+    if (hardStopGuard.detected) {
+        factors.push(hardStopGuard.name);
+        const phienPhanTich = data[0] && data[0].Phien != null ? data[0].Phien : null;
+        let phienDuDoan = null;
+        if (phienPhanTich != null) {
+            if (typeof phienPhanTich === 'number') phienDuDoan = phienPhanTich + 1;
+            else if (/^\d+$/.test(String(phienPhanTich))) phienDuDoan = parseInt(phienPhanTich, 10) + 1;
+            else phienDuDoan = `${phienPhanTich}_next`;
+        }
+        return {
+            prediction  : 'SKIP',
+            action      : 'SKIP',
+            confidence  : 100,
+            phien_phan_tich: phienPhanTich,
+            phien_du_doan  : phienDuDoan,
+            factors,
+            allPatterns,
+            forceReversed: false,
+            antiLossState: getAntiLossState(antiLossKey2),
+            reason      : hardStopGuard.name,
+            detailedAnalysis: {
+                totalPatterns : predictions.length,
+                taiVotes      : predictions.filter(p=>p.prediction==='Tài').length,
+                xiuVotes      : predictions.filter(p=>p.prediction==='Xỉu').length,
+                taiScore, xiuScore,
+                topPattern    : 'HARD STOP',
+                distribution,
+                layersActive  : {},
+                learningStats : {},
+                antiLossGuard : { hardStop: true, reason: hardStopGuard.name },
+            },
+        };
+    }
+
     const antiBoost = analyzeAntiLossBoost(antiLossKey2, taiScore >= xiuScore ? 'Tài' : 'Xỉu');
     if (antiBoost.detected) {
-        const w = LC79_DEFAULT_PATTERN_WEIGHTS['anti_loss_boost'] || 2.5;
-        const boostScore = antiBoost.confidence * 12 * w;
+        const w = LC79_DEFAULT_PATTERN_WEIGHTS['anti_loss_boost'] || 3.0;
+        const boostScore = antiBoost.confidence * 15 * w;
         if (antiBoost.prediction === 'Tài') taiScore += boostScore;
         else xiuScore += boostScore;
         factors.push(antiBoost.name);
@@ -990,10 +1133,61 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     baseConfidence += getAdaptiveConfidenceBoost(type);
 
     const guardResult = applyAntiLossGuard(antiLossKey2, finalPrediction, Math.round(baseConfidence));
+    
+    // ✅ Nếu SKIP, trả về action SKIP
+    if (guardResult.action === 'SKIP') {
+        const phienPhanTich = data[0] && data[0].Phien != null ? data[0].Phien : null;
+        let phienDuDoan = null;
+        if (phienPhanTich != null) {
+            if (typeof phienPhanTich === 'number') phienDuDoan = phienPhanTich + 1;
+            else if (/^\d+$/.test(String(phienPhanTich))) phienDuDoan = parseInt(phienPhanTich, 10) + 1;
+            else phienDuDoan = `${phienPhanTich}_next`;
+        }
+        return {
+            prediction  : 'SKIP',
+            action      : 'SKIP',
+            confidence  : guardResult.confidence,
+            phien_phan_tich: phienPhanTich,
+            phien_du_doan  : phienDuDoan,
+            factors,
+            allPatterns,
+            forceReversed: false,
+            antiLossState: getAntiLossState(antiLossKey2),
+            reason      : guardResult.reason,
+            detailedAnalysis: {
+                totalPatterns : predictions.length,
+                taiVotes      : predictions.filter(p=>p.prediction==='Tài').length,
+                xiuVotes      : predictions.filter(p=>p.prediction==='Xỉu').length,
+                taiScore, xiuScore,
+                topPattern    : predictions.sort((a,b)=>b.priority*b.weight-a.priority*a.weight)[0]?.name || 'N/A',
+                distribution,
+                layersActive  : { markov:!!markovRes.detected, entropy:!!entropyRes.detected, momentum:!!momentumRes.detected, bayesian:!!bayesRes.detected, cluster:!!clusterRes.detected, fourier:!!fourierRes.detected, kelly:!!kellyRes.detected },
+                learningStats : {
+                    totalPredictions   : lc79_learningData[type].totalPredictions,
+                    correctPredictions : lc79_learningData[type].correctPredictions,
+                    accuracy           : lc79_learningData[type].totalPredictions > 0 ? (lc79_learningData[type].correctPredictions/lc79_learningData[type].totalPredictions*100).toFixed(1)+'%' : 'N/A',
+                    currentStreak      : lc79_learningData[type].streakAnalysis?.currentStreak || 0,
+                },
+                antiLossGuard : {
+                    consecutiveLoss  : getAntiLossState(antiLossKey2).consecutiveLoss,
+                    consecutiveWin   : getAntiLossState(antiLossKey2).consecutiveWin,
+                    forceReversed    : false,
+                    penalty          : guardResult.penalty,
+                    totalForceCount  : getAntiLossState(antiLossKey2).forceReverseCount,
+                    hardStop         : false,
+                    reason           : guardResult.reason,
+                    recentAccuracy10 : (()=>{
+                        const r10=getAntiLossState(antiLossKey2).recentResults.slice(-10);
+                        return r10.length ? (r10.filter(Boolean).length/r10.length*100).toFixed(0)+'%' : 'N/A';
+                    })(),
+                },
+            },
+        };
+    }
+
     finalPrediction = guardResult.prediction;
     const finalConfidence = guardResult.confidence;
 
-    // PHIÊN RÕ RÀNG
     const phienPhanTich = data[0] && data[0].Phien != null ? data[0].Phien : null;
     let phienDuDoan = null;
     if (phienPhanTich != null) {
@@ -1012,6 +1206,7 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
         allPatterns,
         forceReversed: guardResult.forceReversed,
         antiLossState: getAntiLossState(antiLossKey2),
+        reason      : guardResult.reason,
         detailedAnalysis: {
             totalPatterns : predictions.length,
             taiVotes      : predictions.filter(p=>p.prediction==='Tài').length,
@@ -1032,6 +1227,8 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
                 forceReversed    : guardResult.forceReversed,
                 penalty          : guardResult.penalty,
                 totalForceCount  : getAntiLossState(antiLossKey2).forceReverseCount,
+                hardStop         : false,
+                reason           : guardResult.reason,
                 recentAccuracy10 : (()=>{
                     const r10=getAntiLossState(antiLossKey2).recentResults.slice(-10);
                     return r10.length ? (r10.filter(Boolean).length/r10.length*100).toFixed(0)+'%' : 'N/A';
@@ -1041,6 +1238,56 @@ function calculateAdvancedPrediction(data, type, antiLossKey) {
     };
 }
 
+// =================================================================================================
+// JSON FORMAT CHO DỰ ĐOÁN - CHUẨN MỚI
+// =================================================================================================
+function buildPredictionJson(result, data) {
+    const phienHienTai = data && data[0] ? data[0].Phien : null;
+    let phienDuDoan = null;
+    if (phienHienTai != null) {
+        if (typeof phienHienTai === 'number') phienDuDoan = phienHienTai + 1;
+        else if (/^\d+$/.test(String(phienHienTai))) phienDuDoan = parseInt(phienHienTai, 10) + 1;
+        else phienDuDoan = `${phienHienTai}_next`;
+    }
+    
+    // Xây dựng giải thích chi tiết
+    let giaiThich = '';
+    if (result.action === 'SKIP') {
+        giaiThich = `⛔ SKIP - ${result.reason || 'Không đủ tin cậy để đặt cược'}`;
+    } else {
+        const factors = result.factors || [];
+        if (factors.length > 0) {
+            giaiThich = factors.join(' | ');
+        } else {
+            giaiThich = `Dự đoán ${result.prediction} dựa trên phân tích tổng hợp`;
+        }
+        if (result.forceReversed) {
+            giaiThich += ` [FORCE REVERSE sau thua liên tiếp]`;
+        }
+        if (result.confidence >= 85) {
+            giaiThich += ` [ĐỘ TIN CẬY RẤT CAO]`;
+        } else if (result.confidence >= 70) {
+            giaiThich += ` [ĐỘ TIN CẬY CAO]`;
+        }
+    }
+    
+    return {
+        phienDuDoan: phienDuDoan,
+        duDoan: result.action === 'SKIP' ? 'SKIP' : result.prediction,
+        doTinCay: result.action === 'SKIP' ? 0 : result.confidence,
+        giaiThich: giaiThich,
+        idol: '@tranhoang2286',
+        phienPhanTich: phienHienTai,
+        action: result.action,
+        forceReversed: result.forceReversed || false,
+        antiLoss: result.detailedAnalysis?.antiLossGuard || {},
+        chiTiet: result.detailedAnalysis || {},
+    };
+}
+
+// =================================================================================================
+// SAVE PREDICTION
+// =================================================================================================
 function savePredictionToHistory(type, phien, prediction, confidence, latestData) {
     if (!lc79_predictionHistory[type]) lc79_predictionHistory[type] = [];
     const record = {
@@ -1642,7 +1889,7 @@ async function lc79_autoProcessPredictions() {
                 savePredictionToHistory('hu',nextPhien,result.prediction,result.confidence,dataHu[0]);
                 lc79_recordPrediction('hu',nextPhien,result.prediction,result.confidence,result.factors);
                 lc79_lastProcessedPhien.hu=nextPhien;
-                log(`[Auto] Hu phân tích phiên ${phienPhanTich} → dự đoán phiên ${nextPhien}: ${result.prediction} (${result.confidence}%)${result.forceReversed?' [FORCE REVERSED]':''}`);
+                log(`[Auto] Hu phân tích phiên ${phienPhanTich} → dự đoán phiên ${nextPhien}: ${result.prediction} (${result.confidence}%)${result.forceReversed?' [FORCE REVERSED]':''}${result.action==='SKIP'?' [SKIP]':''}`);
             }
         }
         const dataMd5=await lc79_fetchDataMd5();
@@ -1655,7 +1902,7 @@ async function lc79_autoProcessPredictions() {
                 savePredictionToHistory('md5',nextPhien,result.prediction,result.confidence,dataMd5[0]);
                 lc79_recordPrediction('md5',nextPhien,result.prediction,result.confidence,result.factors);
                 lc79_lastProcessedPhien.md5=nextPhien;
-                log(`[Auto] MD5 phân tích phiên ${phienPhanTich} → dự đoán phiên ${nextPhien}: ${result.prediction} (${result.confidence}%)${result.forceReversed?' [FORCE REVERSED]':''}`);
+                log(`[Auto] MD5 phân tích phiên ${phienPhanTich} → dự đoán phiên ${nextPhien}: ${result.prediction} (${result.confidence}%)${result.forceReversed?' [FORCE REVERSED]':''}${result.action==='SKIP'?' [SKIP]':''}`);
             }
         }
         lc79_saveLearningData();
@@ -1742,8 +1989,8 @@ function predict_from_json_book(key, history_tx) {
                 else if (acc<0.4) conf=Math.max(0.5,conf-0.1);
             }
             const guardResult=applyAntiLossGuard(`json_${key}`, pred==='T'?'Tài':'Xỉu', Math.round(conf*100));
-            const finalPred=guardResult.prediction==='Tài'?'T':'X';
-            return {prediction:finalPred,confidence:guardResult.confidence,source:'book',pattern_used:pat,pattern_len:cand.len,book_stats:{T:countT,X:countX,total},forceReversed:guardResult.forceReversed};
+            const finalPred=guardResult.action==='SKIP'?'SKIP':(guardResult.prediction==='Tài'?'T':'X');
+            return {prediction:finalPred,confidence:guardResult.confidence,source:'book',pattern_used:pat,pattern_len:cand.len,book_stats:{T:countT,X:countX,total},forceReversed:guardResult.forceReversed,action:guardResult.action,reason:guardResult.reason};
         }
     }
     const last5=history_tx.slice(-5);
@@ -1751,8 +1998,8 @@ function predict_from_json_book(key, history_tx) {
     const xCount=last5.length-tCount;
     let fallbackPred = tCount>xCount?'T':'X';
     const guardResult=applyAntiLossGuard(`json_${key}`, fallbackPred==='T'?'Tài':'Xỉu', 55);
-    fallbackPred=guardResult.prediction==='Tài'?'T':'X';
-    return {prediction:fallbackPred,confidence:guardResult.confidence,source:'fallback_last5',pattern_used:null};
+    fallbackPred=guardResult.action==='SKIP'?'SKIP':(guardResult.prediction==='Tài'?'T':'X');
+    return {prediction:fallbackPred,confidence:guardResult.confidence,source:'fallback_last5',pattern_used:null,action:guardResult.action,reason:guardResult.reason};
 }
 
 function update_json_book_with_actual(key, history_tx, actual, pattern_len_max) {
@@ -1899,13 +2146,15 @@ async function predict_for_game(game, table, source_type, fetcher) {
         else if (/^\d+$/.test(String(latestPhien))) nextPhien = parseInt(latestPhien,10) + 1;
         else nextPhien = `${latestPhien}_next`;
         lc79_recordPrediction(learningKey,nextPhien,result.prediction,result.confidence,result.factors);
+        
+        const predictionJson = buildPredictionJson(result, formatted);
+        
         return {
             success:true, game, table,
             phien_phan_tich: formatted[0].Phien,
             phien_du_doan: nextPhien,
             ket_qua_phien_truoc:formatted[0].Ket_qua,
-            du_doan:result.prediction, action:result.action, do_tin_cay:`${result.confidence}%`,
-            force_reversed:result.forceReversed||false,
+            ...predictionJson,
             cac_cau_phat_hien:result.factors,
             chi_tiet:result.detailedAnalysis,
             so_phien_da_co:formatted.length,
@@ -1923,8 +2172,8 @@ app.use((req,res,next)=>{ log(`${req.method} ${req.url}`); next(); });
 
 app.get('/',(req,res)=>{
     res.json({
-        status:"ALL-IN-ONE Tài Xỉu API v4 - FULL FIX",
-        version:"v4 - All bugs fixed + phien_phan_tich/phien_du_doan",
+        status:"ALL-IN-ONE Tài Xỉu API v5 - MAX 2 LOSS CONTROL",
+        version:"v5 - Hard stop after 2 consecutive losses + JSON format chuẩn",
         endpoints:{
             predict:["/predict/:game/:table","/predict/all"],
             lc79:["/lc79-hu","/lc79-md5","/lc79-hu/analysis","/lc79-md5/analysis","/lc79-hu/learning","/lc79-md5/learning"],
@@ -1932,7 +2181,7 @@ app.get('/',(req,res)=>{
             data:["/api/:game/:table","/games","/api/status"],
             xocdia88:["/api/xocdia88/hu","/api/xocdia88/md5"],
             sicbo:["/sicbo/sumclub","/sicbo/sunlive","/sicbo/luckywin"],
-            anti_loss:["/anti-loss-status","/anti-loss-reset/:key"],
+            anti_loss:["/anti-loss-status","/anti-loss-reset/:key","/anti-loss-hard-stop-reset/:key"],
             metrics:["/metrics"],
         }
     });
@@ -1950,9 +2199,13 @@ app.get('/anti-loss-status',(req,res)=>{
             overallAccuracy:s.totalPredictions>0?((s.totalCorrect/s.totalPredictions)*100).toFixed(1)+'%':'N/A',
             recentAccuracy10:r10.length?((r10.filter(Boolean).length/r10.length)*100).toFixed(0)+'%':'N/A',
             cooldown:s.forceReverseCooldown,
+            hardStopActive:s.hardStopActive,
+            hardStopUntilPhien:s.hardStopUntilPhien,
+            skipCount:s.skipCount,
+            consecutiveSkip:s.consecutiveSkip,
         };
     }
-    res.json({success:true,total_keys:Object.keys(out).length,states:out});
+    res.json({success:true,total_keys:Object.keys(out).length,states:out,config:ANTI_LOSS});
 });
 app.get('/anti-loss-reset/:key',(req,res)=>{
     const key=req.params.key;
@@ -1960,9 +2213,23 @@ app.get('/anti-loss-reset/:key',(req,res)=>{
         ANTI_LOSS_STATE[key].consecutiveLoss=0;
         ANTI_LOSS_STATE[key].consecutiveWin=0;
         ANTI_LOSS_STATE[key].forceReverseCooldown=0;
+        ANTI_LOSS_STATE[key].hardStopActive=false;
+        ANTI_LOSS_STATE[key].hardStopUntilPhien=null;
+        ANTI_LOSS_STATE[key].consecutiveSkip=0;
         res.json({success:true,message:`Reset anti-loss state for ${key}`});
     } else {
         res.json({success:false,error:'Key not found',available:Object.keys(ANTI_LOSS_STATE)});
+    }
+});
+app.get('/anti-loss-hard-stop-reset/:key',(req,res)=>{
+    const key=req.params.key;
+    if (ANTI_LOSS_STATE[key]) {
+        ANTI_LOSS_STATE[key].hardStopActive=false;
+        ANTI_LOSS_STATE[key].hardStopUntilPhien=null;
+        ANTI_LOSS_STATE[key].consecutiveLoss=0;
+        res.json({success:true,message:`Hard stop reset for ${key}`});
+    } else {
+        res.json({success:false,error:'Key not found'});
     }
 });
 
@@ -1999,8 +2266,12 @@ app.get('/lc79-hu',async(req,res)=>{
         const result=calculateAdvancedPrediction(data,'hu','lc79_hu');
         const record=savePredictionToHistory('hu',nextPhien,result.prediction,result.confidence,data[0]);
         lc79_recordPrediction('hu',nextPhien,result.prediction,result.confidence,result.factors);
+        
+        const predictionJson = buildPredictionJson(result, data);
+        
         res.json({
             ...record,
+            ...predictionJson,
             phien_phan_tich: phienPhanTich,
             phien_du_doan: nextPhien,
             action: result.action,
@@ -2019,8 +2290,12 @@ app.get('/lc79-md5',async(req,res)=>{
         const result=calculateAdvancedPrediction(data,'md5','lc79_md5');
         const record=savePredictionToHistory('md5',nextPhien,result.prediction,result.confidence,data[0]);
         lc79_recordPrediction('md5',nextPhien,result.prediction,result.confidence,result.factors);
+        
+        const predictionJson = buildPredictionJson(result, data);
+        
         res.json({
             ...record,
+            ...predictionJson,
             phien_phan_tich: phienPhanTich,
             phien_du_doan: nextPhien,
             action: result.action,
@@ -2038,14 +2313,10 @@ app.get('/lc79-hu/analysis', async (req, res) => {
         if (!data || !data.length) return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
         await lc79_verifyPredictions('hu', data);
         const result = calculateAdvancedPrediction(data, 'hu', 'lc79_hu');
+        const predictionJson = buildPredictionJson(result, data);
         res.json({
             type: 'LC79 HU',
-            phien_phan_tich: data[0].Phien,
-            phien_du_doan: data[0].Phien + 1,
-            du_doan: result.prediction,
-            action: result.action,
-            do_tin_cay: `${result.confidence}%`,
-            force_reversed: result.forceReversed,
+            ...predictionJson,
             cac_cau_phat_hien: result.factors,
             chi_tiet: result.detailedAnalysis,
             learning_stats: {
@@ -2067,14 +2338,10 @@ app.get('/lc79-md5/analysis', async (req, res) => {
         if (!data || !data.length) return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
         await lc79_verifyPredictions('md5', data);
         const result = calculateAdvancedPrediction(data, 'md5', 'lc79_md5');
+        const predictionJson = buildPredictionJson(result, data);
         res.json({
             type: 'LC79 MD5',
-            phien_phan_tich: data[0].Phien,
-            phien_du_doan: data[0].Phien + 1,
-            du_doan: result.prediction,
-            action: result.action,
-            do_tin_cay: `${result.confidence}%`,
-            force_reversed: result.forceReversed,
+            ...predictionJson,
             cac_cau_phat_hien: result.factors,
             chi_tiet: result.detailedAnalysis,
             learning_stats: {
@@ -2092,303 +2359,211 @@ app.get('/lc79-md5/analysis', async (req, res) => {
 
 app.get('/lc79-hu/learning', (req, res) => {
     res.json({
-        type: 'LC79 HU Learning',
+        type: 'LC79 HU',
         totalPredictions: lc79_learningData.hu.totalPredictions,
         correctPredictions: lc79_learningData.hu.correctPredictions,
         accuracy: lc79_learningData.hu.totalPredictions > 0
-            ? (lc79_learningData.hu.correctPredictions / lc79_learningData.hu.totalPredictions * 100).toFixed(2) + '%'
+            ? (lc79_learningData.hu.correctPredictions / lc79_learningData.hu.totalPredictions * 100).toFixed(1) + '%'
             : 'N/A',
-        streakAnalysis: lc79_learningData.hu.streakAnalysis,
-        recentAccuracy: lc79_learningData.hu.recentAccuracy.slice(-20),
-        patternStats: lc79_learningData.hu.patternStats,
+        streak: lc79_learningData.hu.streakAnalysis,
         patternWeights: lc79_learningData.hu.patternWeights,
-        lastUpdate: lc79_learningData.hu.lastUpdate,
+        patternStats: lc79_learningData.hu.patternStats,
+        recentPredictions: lc79_learningData.hu.predictions.slice(0, 20),
+        antiLossState: getAntiLossState('lc79_hu'),
     });
 });
 
 app.get('/lc79-md5/learning', (req, res) => {
     res.json({
-        type: 'LC79 MD5 Learning',
+        type: 'LC79 MD5',
         totalPredictions: lc79_learningData.md5.totalPredictions,
         correctPredictions: lc79_learningData.md5.correctPredictions,
         accuracy: lc79_learningData.md5.totalPredictions > 0
-            ? (lc79_learningData.md5.correctPredictions / lc79_learningData.md5.totalPredictions * 100).toFixed(2) + '%'
+            ? (lc79_learningData.md5.correctPredictions / lc79_learningData.md5.totalPredictions * 100).toFixed(1) + '%'
             : 'N/A',
-        streakAnalysis: lc79_learningData.md5.streakAnalysis,
-        recentAccuracy: lc79_learningData.md5.recentAccuracy.slice(-20),
-        patternStats: lc79_learningData.md5.patternStats,
+        streak: lc79_learningData.md5.streakAnalysis,
         patternWeights: lc79_learningData.md5.patternWeights,
-        lastUpdate: lc79_learningData.md5.lastUpdate,
+        patternStats: lc79_learningData.md5.patternStats,
+        recentPredictions: lc79_learningData.md5.predictions.slice(0, 20),
+        antiLossState: getAntiLossState('lc79_md5'),
     });
+});
+
+app.get('/json-predict/:game/:table', async (req, res) => {
+    try {
+        const { game, table } = req.params;
+        const key = `${game}_${table}`;
+        const st = JSON_PREDICTOR_STATE[key];
+        if (!st) return res.status(404).json({ error: `Không tìm thấy predictor cho ${game}/${table}` });
+        const history_tx = get_latest_history_tx(key);
+        if (history_tx.length < 3) return res.status(400).json({ error: `Không đủ dữ liệu (${history_tx.length} phiên)` });
+        const predResult = predict_from_json_book(key, history_tx);
+        
+        const phienHienTai = st.last_phien;
+        let phienDuDoan = null;
+        if (phienHienTai != null) {
+            if (typeof phienHienTai === 'number') phienDuDoan = phienHienTai + 1;
+            else if (/^\d+$/.test(String(phienHienTai))) phienDuDoan = parseInt(phienHienTai, 10) + 1;
+            else phienDuDoan = `${phienHienTai}_next`;
+        }
+        
+        let giaiThich = '';
+        if (predResult.action === 'SKIP') {
+            giaiThich = `⛔ SKIP - ${predResult.reason || 'Không đủ tin cậy'}`;
+        } else {
+            giaiThich = `Pattern: ${predResult.pattern_used || 'fallback'} (${predResult.source})`;
+            if (predResult.book_stats) {
+                giaiThich += ` | T:${predResult.book_stats.T} X:${predResult.book_stats.X}/${predResult.book_stats.total}`;
+            }
+            if (predResult.forceReversed) {
+                giaiThich += ` [FORCE REVERSED]`;
+            }
+        }
+        
+        res.json({
+            phienDuDoan: phienDuDoan,
+            duDoan: predResult.prediction === 'SKIP' ? 'SKIP' : (predResult.prediction === 'T' ? 'Tài' : 'Xỉu'),
+            doTinCay: predResult.confidence,
+            giaiThich: giaiThich,
+            idol: '@tranhoang2286',
+            source: predResult.source,
+            pattern_used: predResult.pattern_used,
+            action: predResult.action,
+            forceReversed: predResult.forceReversed || false,
+            anti_loss: getAntiLossState(`json_${key}`),
+        });
+    } catch (e) { logError('JSON predict:', e); res.status(500).json({ error: 'Lỗi server' }); }
 });
 
 app.get('/json-predictors', (req, res) => {
     const out = {};
     for (const key in JSON_PREDICTOR_STATE) {
         const st = JSON_PREDICTOR_STATE[key];
-        const hist = get_latest_history_tx(key);
         out[key] = {
-            file: st.file, game: st.game, table: st.table,
-            history_len: st.history.length,
+            game: st.game,
+            table: st.table,
+            file: st.file,
+            src: st.src,
+            history_length: st.history.length,
             book_patterns: Object.keys(st.book).length,
-            pred_log_len: st.pred_log.length,
-            last_phien: st.last_phien, last_pred: st.last_pred,
-            anti_patterns: Object.keys(st.anti).length,
-            live_history_len: hist.length,
-            model_stats_count: Object.keys(st.model_stats).length,
+            pred_log_length: st.pred_log.length,
+            last_phien: st.last_phien,
+            last_pred: st.last_pred,
         };
     }
-    res.json({ success: true, total: Object.keys(out).length, predictors: out });
+    res.json({ total: Object.keys(out).length, predictors: out });
 });
 
-app.get('/json-predict/:game/:table', (req, res) => {
-    const key = `${req.params.game}_${req.params.table}`;
-    if (!JSON_PREDICTOR_STATE[key]) {
-        return res.status(404).json({ error: `JSON predictor không tồn tại cho ${key}`, available: Object.keys(JSON_PREDICTOR_STATE) });
-    }
-    try {
-        const history_tx = get_latest_history_tx(key);
-        if (history_tx.length < 2) {
-            return res.status(400).json({ error: 'Không đủ dữ liệu', history_len: history_tx.length });
-        }
-        const result = predict_from_json_book(key, history_tx);
-        const st = JSON_PREDICTOR_STATE[key];
-        res.json({
-            success: true, game: req.params.game, table: req.params.table,
-            phien_phan_tich: st.last_phien,
-            phien_du_doan: (typeof st.last_phien === 'number') ? st.last_phien + 1 : st.last_phien,
-            history_tx: history_tx.slice(-20), history_len: history_tx.length,
-            du_doan: result.prediction === 'T' ? 'Tài' : 'Xỉu',
-            do_tin_cay: `${result.confidence}%`,
-            source: result.source, pattern_used: result.pattern_used,
-            pattern_len: result.pattern_len, book_stats: result.book_stats,
-            force_reversed: result.forceReversed || false,
-            last_phien: st.last_phien, last_pred: st.last_pred,
-            anti_loss: (() => {
-                const s = getAntiLossState(`json_${key}`);
-                return {
-                    consecutiveLoss: s.consecutiveLoss, consecutiveWin: s.consecutiveWin,
-                    forceReverseCount: s.forceReverseCount,
-                    recentAccuracy10: (() => {
-                        const r10 = s.recentResults.slice(-10);
-                        return r10.length ? (r10.filter(Boolean).length / r10.length * 100).toFixed(0) + '%' : 'N/A';
-                    })(),
-                };
-            })(),
-        });
-    } catch (e) { logError(`json-predict ${key}:`, e); res.status(500).json({ error: e.message }); }
-});
-
-app.get('/json-predict-all', (req, res) => {
-    const out = {};
+app.get('/json-predict-all', async (req, res) => {
+    const results = {};
     for (const key in JSON_PREDICTOR_STATE) {
         try {
-            const history_tx = get_latest_history_tx(key);
-            if (history_tx.length < 2) { out[key] = { error: 'no data', history_len: history_tx.length }; continue; }
-            const result = predict_from_json_book(key, history_tx);
             const st = JSON_PREDICTOR_STATE[key];
-            out[key] = {
-                phien_phan_tich: st.last_phien,
-                phien_du_doan: (typeof st.last_phien === 'number') ? st.last_phien + 1 : st.last_phien,
-                du_doan: result.prediction === 'T' ? 'Tài' : 'Xỉu',
-                do_tin_cay: `${result.confidence}%`,
-                source: result.source, pattern_used: result.pattern_used,
-                force_reversed: result.forceReversed || false,
-                history_len: history_tx.length,
+            const history_tx = get_latest_history_tx(key);
+            if (history_tx.length < 3) {
+                results[key] = { error: 'Không đủ dữ liệu' };
+                continue;
+            }
+            const predResult = predict_from_json_book(key, history_tx);
+            const phienHienTai = st.last_phien;
+            let phienDuDoan = null;
+            if (phienHienTai != null) {
+                if (typeof phienHienTai === 'number') phienDuDoan = phienHienTai + 1;
+                else if (/^\d+$/.test(String(phienHienTai))) phienDuDoan = parseInt(phienHienTai, 10) + 1;
+                else phienDuDoan = `${phienHienTai}_next`;
+            }
+            let giaiThich = predResult.action === 'SKIP' 
+                ? `⛔ SKIP - ${predResult.reason || 'Không đủ tin cậy'}`
+                : `Pattern: ${predResult.pattern_used || 'fallback'} (${predResult.source})`;
+            
+            results[key] = {
+                phienDuDoan,
+                duDoan: predResult.prediction === 'SKIP' ? 'SKIP' : (predResult.prediction === 'T' ? 'Tài' : 'Xỉu'),
+                doTinCay: predResult.confidence,
+                giaiThich,
+                idol: '@tranhoang2286',
+                action: predResult.action,
+                forceReversed: predResult.forceReversed || false,
             };
-        } catch (e) { out[key] = { error: e.message }; }
+        } catch (e) {
+            results[key] = { error: e.message };
+        }
     }
-    res.json({ success: true, total: Object.keys(out).length, predictions: out });
+    res.json({ success: true, total: Object.keys(results).length, predictions: results });
 });
 
-app.get('/predict/:game/:table', async (req, res) => {
-    const { game, table } = req.params;
-    const g = game.toLowerCase(), t = table.toLowerCase();
-    try {
-        let source_type = 'full_py';
-        if (['luckywin'].includes(g)) source_type = 'sicbo';
-        else if (['sumclub'].includes(g) && t === 'hu') source_type = 'sicbo';
-        else if (['sunlive'].includes(g)) source_type = 'sicbo';
-        else if (['xocdia88'].includes(g)) source_type = 'xocdia88';
-        else if (['sicbosum'].includes(g)) source_type = 'sicbosum';
-        const result = await predict_for_game(g, t, source_type, null);
-        if (!result.success) return res.status(400).json(result);
-        res.json(result);
-    } catch (e) { logError(`/predict/${g}/${t}:`, e); res.status(500).json({ error: e.message }); }
-});
-
+// ========================== PREDICT ALL ==========================
 app.get('/predict/all', async (req, res) => {
+    const games = ['lc79', 'b52', 'hitclub', 'betvip', 'rikvip', 'sumclub', 'luck8', 'sunwin', '68gb', '789club'];
     const results = {};
-    const games = [
-        { g: 'lc79', t: 'hu', src: 'full_py' }, { g: 'lc79', t: 'md5', src: 'full_py' },
-        { g: 'b52', t: 'hu', src: 'full_py' }, { g: 'b52', t: 'md5', src: 'full_py' },
-        { g: 'hitclub', t: 'hu', src: 'full_py' }, { g: 'hitclub', t: 'md5', src: 'full_py' },
-        { g: 'rikvip', t: 'hu', src: 'full_py' }, { g: 'rikvip', t: 'md5', src: 'full_py' },
-        { g: 'betvip', t: 'hu', src: 'full_py' }, { g: 'betvip', t: 'md5', src: 'full_py' },
-        { g: '68gb', t: 'hu', src: 'full_py' }, { g: '68gb', t: 'md5', src: 'full_py' },
-        { g: 'luck8', t: 'txhu', src: 'full_py' }, { g: 'luck8', t: 'txmd5', src: 'full_py' }, { g: 'luck8', t: 'tx3p', src: 'full_py' },
-        { g: '789club', t: 'live', src: 'full_py' }, { g: '789club', t: 'minigame', src: 'full_py' },
-        { g: 'sunwin', t: 'main', src: 'full_py' },
-        { g: 'sumclub', t: 'hu', src: 'full_py' }, { g: 'sumclub', t: 'md5', src: 'full_py' },
-    ];
-    for (const { g, t, src } of games) {
-        try {
-            if (!DATA_STORE[g]?.[t]?.length) { results[`${g}_${t}`] = { error: 'no data', count: 0 }; continue; }
-            const result = await predict_for_game(g, t, src, null);
-            results[`${g}_${t}`] = result.success ? {
-                phien_phan_tich: result.phien_phan_tich,
-                phien_du_doan: result.phien_du_doan,
-                du_doan: result.du_doan, action: result.action, do_tin_cay: result.do_tin_cay,
-                force_reversed: result.force_reversed, so_phien: result.so_phien_da_co,
-                anti_loss: result.anti_loss,
-            } : { error: result.error };
-        } catch (e) { results[`${g}_${t}`] = { error: e.message }; }
+    for (const game of games) {
+        for (const table of Object.keys(DATA_STORE[game] || {})) {
+            try {
+                const data = DATA_STORE[game][table];
+                if (!data || data.length < 5) {
+                    results[`${game}_${table}`] = { error: `Không đủ dữ liệu (${data?.length || 0})` };
+                    continue;
+                }
+                const result = await predict_for_game(game, table, 'full_py');
+                results[`${game}_${table}`] = result;
+            } catch (e) {
+                results[`${game}_${table}`] = { error: e.message };
+            }
+        }
     }
-    res.json({ success: true, timestamp: new Date().toISOString(), total: Object.keys(results).length, results });
+    res.json({ success: true, total: Object.keys(results).length, predictions: results });
 });
 
-app.get('/games', (req, res) => {
-    const out = {};
-    for (const g in DATA_STORE) {
-        out[g] = { enabled: GAME_STATUS[g] !== false, tables: Object.keys(DATA_STORE[g]), counts: {} };
-        for (const t in DATA_STORE[g]) out[g].counts[t] = DATA_STORE[g][t].length;
-    }
-    res.json(out);
+// ========================== START SERVER ==========================
+const server = app.listen(PORT, () => {
+    log(`🚀 SERVER STARTED ON PORT ${PORT}`);
+    log(`📡 API: http://localhost:${PORT}`);
+    log(`🛑 ANTI-LOSS: MAX 2 CONSECUTIVE LOSS - HARD STOP AFTER 2`);
+    log(`📊 HARD_STOP_AT: ${ANTI_LOSS.HARD_STOP_AT}`);
+    log(`🔄 FORCE_REVERSE_AT: ${ANTI_LOSS.FORCE_REVERSE_AT}`);
+    
+    lc79_loadLearningData();
+    loadAllJsonData();
+    load_all_json_predictors();
+    start_all_full_py_workers();
+    start_xocdia88_workers();
+    start_sicbo_workers();
+    start_sicbosum_ws();
+    lc79_startAutoSaveTask();
+    start_json_auto_update_task();
 });
 
-app.get('/metrics', (req, res) => {
-    const mem = process.memoryUsage();
-    const uptime = process.uptime();
-    let totalPreds = 0, totalCorrect = 0;
-    for (const key in ANTI_LOSS_STATE) {
-        totalPreds += ANTI_LOSS_STATE[key].totalPredictions || 0;
-        totalCorrect += ANTI_LOSS_STATE[key].totalCorrect || 0;
+// ========================== GRACEFUL SHUTDOWN ==========================
+process.on('SIGINT', () => {
+    log('🛑 SIGINT received. Saving data...');
+    lc79_saveLearningData();
+    for (const key in JSON_PREDICTOR_STATE) {
+        save_json_predictor_state(key);
     }
-    res.json({
-        uptime_seconds: Math.round(uptime),
-        uptime_human: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${Math.floor(uptime%60)}s`,
-        memory: {
-            rss_mb: (mem.rss / 1024 / 1024).toFixed(1),
-            heap_used_mb: (mem.heapUsed / 1024 / 1024).toFixed(1),
-            heap_total_mb: (mem.heapTotal / 1024 / 1024).toFixed(1),
-            external_mb: (mem.external / 1024 / 1024).toFixed(1),
-        },
-        predictions: {
-            total: totalPreds, correct: totalCorrect,
-            overall_accuracy: totalPreds > 0 ? (totalCorrect/totalPreds*100).toFixed(2) + '%' : 'N/A',
-        },
-        data_store_games: Object.keys(DATA_STORE).length,
-        anti_loss_keys: Object.keys(ANTI_LOSS_STATE).length,
-        json_predictors: Object.keys(JSON_PREDICTOR_STATE).length,
-        lc79_learning_keys: Object.keys(lc79_learningData).length,
-        node_version: process.version,
-        platform: process.platform,
+    server.close(() => {
+        log('✅ Server closed. Bye!');
+        process.exit(0);
     });
+    setTimeout(() => process.exit(1), 5000);
 });
 
-app.use((req, res) => {
-    res.status(404).json({ error: 'Endpoint không tồn tại', path: req.url, method: req.method });
+process.on('SIGTERM', () => {
+    log('🛑 SIGTERM received. Saving data...');
+    lc79_saveLearningData();
+    for (const key in JSON_PREDICTOR_STATE) {
+        save_json_predictor_state(key);
+    }
+    server.close(() => {
+        log('✅ Server closed. Bye!');
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000);
 });
 
-app.use((err, req, res, next) => {
-    logError(`Unhandled ${req.method} ${req.url}:`, err);
-    res.status(500).json({ error: 'Lỗi server không xác định', message: err.message });
-});
-
-// =================================================================================================
-// GLOBAL ERROR HANDLERS
-// =================================================================================================
 process.on('uncaughtException', (err) => {
     logError('UNCAUGHT EXCEPTION:', err);
-    logError('Stack:', err.stack);
 });
+
 process.on('unhandledRejection', (reason, promise) => {
-    logError('UNHANDLED REJECTION at:', promise);
-    logError('Reason:', reason);
+    logError('UNHANDLED REJECTION:', reason);
 });
-
-// =================================================================================================
-// STARTUP
-// =================================================================================================
-function startServer() {
-    log('================================================================================');
-    log('   ALL-IN-ONE TÀI XỈU API v4 - FULL FIX');
-    log('================================================================================');
-
-    log('[STARTUP] Loading JSON predictor files...');
-    load_all_json_predictors();
-    log('[STARTUP] Loading JSON data into DATA_STORE...');
-    loadAllJsonData();
-    log('[STARTUP] Loading LC79 learning data...');
-    lc79_loadLearningData();
-
-    log('[STARTUP] Starting all data collection workers...');
-    try { start_all_full_py_workers(); } catch (e) { logError('full_py workers:', e); }
-    try { start_xocdia88_workers(); } catch (e) { logError('xocdia88 workers:', e); }
-    try { start_sicbo_workers(); } catch (e) { logError('sicbo workers:', e); }
-    try { start_sicbosum_ws(); } catch (e) { logError('sicbosum ws:', e); }
-
-    log('[STARTUP] Starting auto tasks...');
-    try { lc79_startAutoSaveTask(); } catch (e) { logError('LC79 auto task:', e); }
-    try { start_json_auto_update_task(); } catch (e) { logError('JSON auto task:', e); }
-
-    setInterval(() => {
-        try { lc79_saveLearningData(); } catch (e) { logError('Periodic LC79 save:', e); }
-        for (const key in JSON_PREDICTOR_STATE) {
-            const st = JSON_PREDICTOR_STATE[key];
-            if (st && st.dirty) {
-                try { save_json_predictor_state(key); } catch (e) { logError(`Periodic save ${key}:`, e); }
-            }
-        }
-    }, 60000);
-
-    const server = app.listen(PORT, () => {
-        log(`[STARTUP] ✅ HTTP server listening on port ${PORT}`);
-        log(`[STARTUP] ✅ Anti-Loss Guard: max ${ANTI_LOSS.MAX_CONSECUTIVE_LOSS} losses, force-reverse=${ANTI_LOSS.ENABLE_FORCE_REVERSE}`);
-        log(`[STARTUP] ✅ 7 engines: Markov, Entropy, Momentum WMA, Bayesian, Cluster, Fourier, Kelly`);
-        log(`[STARTUP] ✅ Data sources: ${Object.keys(DATA_STORE).length} games`);
-        log(`[STARTUP] ✅ JSON predictors: ${Object.keys(JSON_PREDICTOR_STATE).length} files`);
-        log(`[STARTUP] ✅ Metrics: http://localhost:${PORT}/metrics`);
-        log('================================================================================');
-    });
-
-    server.on('error', (err) => {
-        logError('HTTP server error:', err);
-        if (err.code === 'EADDRINUSE') {
-            logError(`Port ${PORT} đang được sử dụng. Thoát sau 3s...`);
-            setTimeout(() => process.exit(1), 3000);
-        }
-    });
-
-    const shutdown = (signal) => {
-        log(`${signal} received - graceful shutdown...`);
-        server.close(() => {
-            log('HTTP server closed.');
-            try { lc79_saveLearningData(); } catch (e) { /* silent */ }
-            for (const key in JSON_PREDICTOR_STATE) {
-                try { save_json_predictor_state(key); } catch (e) { /* silent */ }
-            }
-            log('All data saved. Exiting.');
-            process.exit(0);
-        });
-        setTimeout(() => {
-            logError('Forced shutdown after 10s timeout');
-            process.exit(1);
-        }, 10000);
-    };
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-}
-
-startServer();
-
-module.exports = {
-    app,
-    calculateAdvancedPrediction,
-    predict_for_game,
-    getAntiLossState,
-    applyAntiLossGuard,
-    ANTI_LOSS,
-    lc79_learningData,
-    DATA_STORE,
-};
