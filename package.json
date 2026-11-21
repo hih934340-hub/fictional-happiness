@@ -1,0 +1,17 @@
+{
+  "name": "all-in-one-taixiu-api",
+  "version": "1.0.0",
+  "description": "ALL-IN-ONE Tài Xỉu API",
+  "main": "all_in_one.js",
+  "scripts": {
+    "start": "node all_in_one.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
