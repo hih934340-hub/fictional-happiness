@@ -8,6 +8,7 @@
 // ✅ KHÔNG BAO GIỜ SKIP - luôn dự đoán Tài hoặc Xỉu
 // ✅ Cầu detection + bẻ cầu
 // ✅ JSON gọn: phien, ketQua, tong, phienDoan, duDoan, tiLe
+// ✅ [NEW] pattern_10.json + history_dudoan.json + /api/history/dudoan
 // =================================================================================================
 
 const path = require('path');
@@ -48,6 +49,23 @@ const HOST = process.env.HOST || '0.0.0.0';
 const MAX_HISTORY = 200;
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 const logError = (msg, err) => console.error(`[${new Date().toISOString()}] [ERROR] ${msg}`, err ? (err.message || err) : '');
+
+// ========================== [NEW] STORAGE PATHS ==========================
+const PATTERN_10_FILE = path.join(DATA_DIR, 'pattern_10.json');
+const HISTORY_DUDOAN_FILE = path.join(DATA_DIR, 'history_dudoan.json');
+
+function loadJsonFileSafe(file, fallback) {
+    try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) {}
+    return fallback;
+}
+
+function saveJsonFileSafe(file, data) {
+    try { fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); } catch (e) { logError('[SAVE_JSON]', e); }
+}
+
+// Khởi tạo state lưu trữ
+let PATTERN_10_STORE = loadJsonFileSafe(PATTERN_10_FILE, { pattern_10: [] });
+let HISTORY_DUDOAN_STORE = loadJsonFileSafe(HISTORY_DUDOAN_FILE, []);
 
 // ========================== ANTI-LOSS ==========================
 const ANTI_LOSS = {
@@ -255,6 +273,59 @@ function updateAntiLossState(key, predicted, actual, phien) {
     s.lastPrediction = predicted; s.lastActual = actual;
     _updateDailyTracker(isCorrect);
     return isCorrect;
+}
+
+// =================================================================================================
+// [NEW] RECORD PREDICTION TO HISTORY (AUDU LAI BU / DITMEMAY LAI GAY)
+// =================================================================================================
+function recordPredictionHistory(gameKey, phienTruoc, result, phienNay, duDoan, doTinCay) {
+    try {
+        // Chuẩn hóa
+        const resultStr = (result === 'Tài' || result === 'T') ? 'Tài' : (result === 'Xỉu' || result === 'X') ? 'Xỉu' : String(result);
+        const duDoanStr = (duDoan === 'Tài' || duDoan === 'T') ? 'Tài' : (duDoan === 'Xỉu' || duDoan === 'X') ? 'Xỉu' : String(duDoan);
+
+        // Xác định trạng thái dựa trên kết quả thực tế vs dự đoán
+        let trangThai;
+        if (resultStr === duDoanStr) {
+            trangThai = 'AUDU LAI BU✅';
+        } else {
+            trangThai = 'DITMEMAY LAI GAY';
+        }
+
+        const record = {
+            game: gameKey,
+            phien_truoc: phienTruoc,
+            result: resultStr,
+            Phien_nay: phienNay,
+            Du_doan: duDoanStr,
+            Do_tin_cay: doTinCay,
+            Trang_thai: trangThai,
+            timestamp: new Date().toISOString()
+        };
+
+        HISTORY_DUDOAN_STORE.unshift(record);
+        if (HISTORY_DUDOAN_STORE.length > 1000) HISTORY_DUDOAN_STORE.length = 1000;
+
+        saveJsonFileSafe(HISTORY_DUDOAN_FILE, HISTORY_DUDOAN_STORE);
+    } catch (e) { logError('[recordPredictionHistory]', e); }
+}
+
+// =================================================================================================
+// [NEW] UPDATE PATTERN_10
+// =================================================================================================
+function updatePattern10(ketQua) {
+    try {
+        const code = (ketQua === 'Tài' || ketQua === 'T') ? 'T' : (ketQua === 'Xỉu' || ketQua === 'X') ? 'X' : null;
+        if (!code) return;
+
+        // push vào đầu, giữ tối đa 10 phần tử
+        PATTERN_10_STORE.pattern_10.unshift(code);
+        if (PATTERN_10_STORE.pattern_10.length > 10) {
+            PATTERN_10_STORE.pattern_10.length = 10;
+        }
+
+        saveJsonFileSafe(PATTERN_10_FILE, PATTERN_10_STORE);
+    } catch (e) { logError('[updatePattern10]', e); }
 }
 
 // =================================================================================================
@@ -828,7 +899,7 @@ async function fetchLC79Hu() { try { return transformLC79((await axios.get(LC79_
 async function fetchLC79Md5() { try { return transformLC79((await axios.get(LC79_API_URL_MD5, { timeout: 10000 })).data); } catch (e) { return null; } }
 
 // =================================================================================================
-// AUTO VERIFY
+// AUTO VERIFY + [NEW] AUTO RECORD HISTORY & PATTERN_10
 // =================================================================================================
 const LAST_PREDICTION = {};
 
@@ -840,7 +911,13 @@ async function autoVerifyLoop() {
                 const p = LAST_PREDICTION['lc79_hu'];
                 if (p) {
                     const actual = hu.find(d => String(d.Phien) === String(p.phien));
-                    if (actual) { updateAntiLossState('lc79_hu', p.prediction, actual.Ket_qua, p.phien); delete LAST_PREDICTION['lc79_hu']; }
+                    if (actual) {
+                        updateAntiLossState('lc79_hu', p.prediction, actual.Ket_qua, p.phien);
+                        // [NEW] Ghi history + pattern_10
+                        recordPredictionHistory('lc79_hu', p.currentPhien, actual.Ket_qua, p.phien, p.prediction, p.confidence);
+                        updatePattern10(actual.Ket_qua);
+                        delete LAST_PREDICTION['lc79_hu'];
+                    }
                 }
             }
             const md5 = await fetchLC79Md5();
@@ -848,7 +925,13 @@ async function autoVerifyLoop() {
                 const p = LAST_PREDICTION['lc79_md5'];
                 if (p) {
                     const actual = md5.find(d => String(d.Phien) === String(p.phien));
-                    if (actual) { updateAntiLossState('lc79_md5', p.prediction, actual.Ket_qua, p.phien); delete LAST_PREDICTION['lc79_md5']; }
+                    if (actual) {
+                        updateAntiLossState('lc79_md5', p.prediction, actual.Ket_qua, p.phien);
+                        // [NEW] Ghi history + pattern_10
+                        recordPredictionHistory('lc79_md5', p.currentPhien, actual.Ket_qua, p.phien, p.prediction, p.confidence);
+                        updatePattern10(actual.Ket_qua);
+                        delete LAST_PREDICTION['lc79_md5'];
+                    }
                 }
             }
             for (const game in DATA_STORE) {
@@ -858,7 +941,14 @@ async function autoVerifyLoop() {
                     if (!p) continue;
                     const arr = DATA_STORE[game][table];
                     const actual = arr.find(d => String(d.phien) === String(p.phien));
-                    if (actual) { updateAntiLossState(key, p.prediction, actual.ket_qua || actual.Ket_qua, p.phien); delete LAST_PREDICTION[key]; }
+                    if (actual) {
+                        const actualKq = actual.ket_qua || actual.Ket_qua;
+                        updateAntiLossState(key, p.prediction, actualKq, p.phien);
+                        // [NEW] Ghi history + pattern_10
+                        recordPredictionHistory(key, p.currentPhien, actualKq, p.phien, p.prediction, p.confidence);
+                        updatePattern10(actualKq);
+                        delete LAST_PREDICTION[key];
+                    }
                 }
             }
         } catch (e) { logError('[AutoVerify]', e); }
@@ -1164,6 +1254,24 @@ app.get('/api/games', (req, res) => {
     res.json({ total: games.length, games });
 });
 
+// ========================== [NEW] API pattern_10 ==========================
+app.get('/api/pattern10', (req, res) => {
+    res.json({ pattern_10: PATTERN_10_STORE.pattern_10, total: PATTERN_10_STORE.pattern_10.length });
+});
+
+// ========================== [NEW] API history dudoan ==========================
+app.get('/api/history/dudoan', (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 1000, 1000);
+    const gameFilter = req.query.game;
+    let list = HISTORY_DUDOAN_STORE;
+    if (gameFilter) list = list.filter(h => h.game === gameFilter);
+    res.json({
+        total: list.length,
+        showing: Math.min(limit, list.length),
+        history: list.slice(0, limit)
+    });
+});
+
 // ENDPOINT CHÍNH
 app.get('/api/predict/:game/:table', async (req, res) => {
     try {
@@ -1183,7 +1291,12 @@ app.get('/api/predict/:game/:table', async (req, res) => {
         const result = calculatePrediction(data, key, key);
 
         if (result.action === 'BET' && result.phienDoan != null) {
-            LAST_PREDICTION[key] = { phien: result.phienDoan, prediction: result.prediction };
+            LAST_PREDICTION[key] = {
+                phien: result.phienDoan,
+                currentPhien: result.phienPhanTich,
+                prediction: result.prediction,
+                confidence: result.confidence
+            };
         }
 
         res.json(buildCompactResponse(data, result));
@@ -1207,7 +1320,12 @@ app.get('/predict/:type', async (req, res) => {
         const key = `lc79_${type}`;
         const result = calculatePrediction(data, type, key);
         if (result.action === 'BET' && result.phienDoan != null) {
-            LAST_PREDICTION[key] = { phien: result.phienDoan, prediction: result.prediction };
+            LAST_PREDICTION[key] = {
+                phien: result.phienDoan,
+                currentPhien: result.phienPhanTich,
+                prediction: result.prediction,
+                confidence: result.confidence
+            };
         }
         res.json(buildCompactResponse(data, result));
     } catch (e) {
@@ -1259,6 +1377,15 @@ app.get('/api/state/:key', (req, res) => {
     });
 });
 
+// ========================== [NEW] API ADMIN reset history ==========================
+app.post('/api/reset/history', (req, res) => {
+    HISTORY_DUDOAN_STORE = [];
+    PATTERN_10_STORE = { pattern_10: [] };
+    saveJsonFileSafe(HISTORY_DUDOAN_FILE, HISTORY_DUDOAN_STORE);
+    saveJsonFileSafe(PATTERN_10_FILE, PATTERN_10_STORE);
+    res.json({ status: 'ok', message: 'Đã reset history và pattern_10' });
+});
+
 // 404
 app.use((req, res) => {
     res.status(404).json({ error: 'NOT_FOUND', path: req.path, hint: 'Mở / hoặc /tool để xem UI' });
@@ -1302,6 +1429,8 @@ function startAll() {
         log(`   GET /api/games`);
         log(`   GET /api/info`);
         log(`   GET /api/health`);
+        log(`   [NEW] GET /api/pattern10`);
+        log(`   [NEW] GET /api/history/dudoan?limit=1000&game=lc79_hu`);
         log('');
         log('💡 DÙNG TRONG HTML TOOL KHÁC:');
         log(`   fetch('http://${ips[0] || 'localhost'}:${PORT}/api/predict/lc79/hu')`);
