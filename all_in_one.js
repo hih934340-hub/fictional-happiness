@@ -1,18 +1,17 @@
 'use strict';
 
 /**
- * @fileoverview taixiu-ai-v11.js — Hệ thống dự đoán Tài Xỉu AI (FULL - KHÔNG SKIP)
+ * @fileoverview taixiu-ai-v12.js — Hệ thống dự đoán Tài Xỉu AI (FULL GỘP ALL)
  * @description
- *   - KHÔNG có demo/CLI giả lập
- *   - Server chạy thật, kết nối workers thật
- *   - HỌC CẦU: nếu dự đoán sai (Tài↔Xỉu) → ghi nhớ cầu đó → phiên sau gặp lại cầu y hệt → ĐẢO NGƯỢC
- *   - Đọc/ghi đồng bộ: pattern_10.json, history_dudoan.json, learning_history.json
- *   - Giữ nguyên JSON schema: { phien, ketQua, tong, phienDoan, duDoan, tiLe }
- *   - v11: KHÔNG SKIP - luôn dự đoán. Tín hiệu yếu → tiLe 50%.
- *          ANTI-STREAK: không bao giờ sai quá 2 phiên liên tiếp.
+ *   - TÍCH HỢP lc79_md5.json (book transition matrix bậc 1-9 + history 100 phiên)
+ *   - GIỮ NGUYÊN 100% JSON schema: { phien, ketQua, tong, phienDoan, duDoan, tiLe }
+ *   - GIỮ NGUYÊN tất cả endpoints của v11
+ *   - THÊM: Book Markov predictor (bậc 1-9), Long Streak Detector, Ensemble v12
+ *   - KHÔNG SKIP - luôn dự đoán. Tín hiệu yếu → tiLe 50%.
+ *   - ANTI-STREAK: không bao giờ sai quá 2 phiên liên tiếp.
  *
- * @author   @tranhoang2286
- * @version  11.0.0
+ * @author   @tranhoang2286 (v12 upgrade)
+ * @version  12.0.0
  */
 
 // ═══════════════════════════════════════════════════════════
@@ -61,6 +60,8 @@ const PATTERN_10_FILE     = path.join(DATA_DIR, 'pattern_10.json');
 const HISTORY_DUDOAN_FILE = path.join(DATA_DIR, 'history_dudoan.json');
 const LEARNING_FILE       = path.join(DATA_DIR, 'learning_history.json');
 const CAU_MEMORY_FILE     = path.join(DATA_DIR, 'cau_memory.json');
+const LC79_MD5_FILE       = path.join(DATA_DIR, 'lc79_md5.json');
+const LC79_HU_FILE        = path.join(DATA_DIR, 'lc79_hu.json');
 
 // ═══════════════════════════════════════════════════════════
 // TIỆN ÍCH
@@ -82,32 +83,36 @@ function saveJson(file, data) {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ═══════════════════════════════════════════════════════════
-// THAM SỐ ANTI-LOSS v11 (FORM v2.0)
+// THAM SỐ ANTI-LOSS v12
 // ═══════════════════════════════════════════════════════════
 const ANTI_LOSS = Object.freeze({
-  MAX_CONSECUTIVE_LOSS : 2,           // Không cho sai quá 2 phiên
-  FORCE_REVERSE_AT     : 2,           // Thua 2 → force reverse
-  MIN_CONFIDENCE       : 50,          // Không bao giờ dưới 50 (vì không skip)
+  MAX_CONSECUTIVE_LOSS : 2,
+  FORCE_REVERSE_AT     : 2,
+  MIN_CONFIDENCE       : 50,
   MAX_CONFIDENCE       : 92,
-  HARD_STOP_AT         : 2,           // Sai 2 → hard stop
-  WEAK_SIGNAL_CONF     : 50,          // Tín hiệu yếu = 50%
-  COOLDOWN_PHIEN       : 2,           // Cooldown 2 phiên sau khi sai 2
+  HARD_STOP_AT         : 2,
+  WEAK_SIGNAL_CONF     : 50,
+  COOLDOWN_PHIEN       : 2,
 });
 
 const ANTI_LOSS_V2 = Object.freeze({
   ENABLED              : true,
-  CONFIDENCE_FLOOR_BY_LOSS : { 0: 50, 1: 58, 2: 65, 3: 72, 4: 80 }, // v11: không bao giờ < 50
+  CONFIDENCE_FLOOR_BY_LOSS : { 0: 50, 1: 58, 2: 65, 3: 72, 4: 80 },
   CROSS_CHECK_PENALTY  : 12,
   CONFLICT_BALANCE_THRESHOLD: 0.05,
   CAU_MAX_LENGTH       : 8,
-  // GATE theo form v2.0
-  GATE1_MIN_CAU_LEN    : 3,           // Cầu phải rõ >=3 nhịp
-  GATE3_TAI_THRESHOLD  : 13,          // Tài mạnh khi điểm >= 13
-  GATE3_XIU_THRESHOLD  : 8,           // Xỉu mạnh khi điểm <= 8
+  GATE1_MIN_CAU_LEN    : 3,
+  GATE3_TAI_THRESHOLD  : 13,
+  GATE3_XIU_THRESHOLD  : 8,
+  // v12: Book
+  BOOK_MIN_SAMPLE      : 20,
+  BOOK_MIN_CONFIDENCE  : 58,
+  BOOK_LONG_STREAK_THRESHOLD: 6,   // >=6 liên tiếp → cầu bệt dài → ưu tiên bẻ
+  BOOK_PRIORITY        : 18,       // priority cao nhất trong ensemble
 });
 
 // ═══════════════════════════════════════════════════════════
-// CẦU MEMORY — HỌC CẦU SAI (v11: WEIGHTED)
+// CẦU MEMORY
 // ═══════════════════════════════════════════════════════════
 let CAU_MEMORY = loadJson(CAU_MEMORY_FILE, {});
 
@@ -128,16 +133,9 @@ function learnCau(signature, predicted, actual, cauInfo) {
     };
   }
   const m = CAU_MEMORY[signature];
-  if (predicted === actual) {
-    m.correct++;
-    m.consecutiveWrong = 0;
-  } else {
-    m.wrong++;
-    m.consecutiveWrong = (m.consecutiveWrong || 0) + 1;
-  }
-  m.lastPredicted = predicted;
-  m.lastActual    = actual;
-  m.lastUpdated   = Date.now();
+  if (predicted === actual) { m.correct++; m.consecutiveWrong = 0; }
+  else { m.wrong++; m.consecutiveWrong = (m.consecutiveWrong || 0) + 1; }
+  m.lastPredicted = predicted; m.lastActual = actual; m.lastUpdated = Date.now();
 
   const keys = Object.keys(CAU_MEMORY);
   if (keys.length > 500) {
@@ -147,12 +145,6 @@ function learnCau(signature, predicted, actual, cauInfo) {
   saveJson(CAU_MEMORY_FILE, CAU_MEMORY);
 }
 
-/**
- * v11: WEIGHTED REVERSE
- * - Sai 1 lần gần nhất → đảo nhẹ (confidence thấp)
- * - Sai >=2 liên tiếp → đảo mạnh (confidence cao)
- * - Winrate < 40% qua >= 3 lần → đảo
- */
 function checkCauMemory(signature) {
   const m = CAU_MEMORY[signature];
   if (!m) return { shouldReverse: false, reverseTo: null, reason: 'Chưa có trong memory', stats: null, strength: 0 };
@@ -161,36 +153,30 @@ function checkCauMemory(signature) {
   const winRate = total > 0 ? m.correct / total : 0;
   const consecWrong = m.consecutiveWrong || 0;
 
-  // Sai >= 2 liên tiếp → ĐẢO MẠNH
   if (consecWrong >= 2) {
     const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
     return {
-      shouldReverse: true,
-      reverseTo,
+      shouldReverse: true, reverseTo,
       reason: `Cầu ${m.type} SAI ${consecWrong} lần liên tiếp → ĐẢO MẠNH sang ${reverseTo}`,
       stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
-      strength: 3, // mạnh nhất
+      strength: 3,
     };
   }
 
-  // Sai lần gần nhất → ĐẢO NHẸ
   if (m.lastPredicted && m.lastActual && m.lastPredicted !== m.lastActual) {
     const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
     return {
-      shouldReverse: true,
-      reverseTo,
+      shouldReverse: true, reverseTo,
       reason: `Cầu ${m.type} lần trước SAI (đoán ${m.lastPredicted}, ra ${m.lastActual}) → ĐẢO sang ${reverseTo}`,
       stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
       strength: 1,
     };
   }
 
-  // Winrate thấp qua >= 3 lần → ĐẢO
   if (total >= 3 && winRate < 0.4) {
     const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
     return {
-      shouldReverse: true,
-      reverseTo,
+      shouldReverse: true, reverseTo,
       reason: `Cầu ${m.type} winRate thấp ${(winRate * 100).toFixed(1)}% → ĐẢO`,
       stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
       strength: 2,
@@ -198,8 +184,7 @@ function checkCauMemory(signature) {
   }
 
   return {
-    shouldReverse: false,
-    reverseTo: null,
+    shouldReverse: false, reverseTo: null,
     reason: `Cầu ${m.type} winRate ${(winRate * 100).toFixed(1)}% (${m.correct}/${total}) → giữ nguyên`,
     stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
     strength: 0,
@@ -255,6 +240,157 @@ let HISTORY_DUDOAN_STORE = loadJson(HISTORY_DUDOAN_FILE, []);
 let LEARNING_STORE       = loadJson(LEARNING_FILE,       []);
 
 // ═══════════════════════════════════════════════════════════
+// LC79 BOOK STORE — TÍCH HỢP TỪ lc79_md5.json
+// ═══════════════════════════════════════════════════════════
+let LC79_MD5_BOOK   = loadJson(LC79_MD5_FILE, null);   // { history:[], book:{} }
+let LC79_HU_BOOK    = loadJson(LC79_HU_FILE,  null);
+
+/**
+ * Nạp book từ file JSON cho từng table lc79
+ */
+function loadLc79Book(table) {
+  if (table === 'md5') return LC79_MD5_BOOK;
+  if (table === 'hu')  return LC79_HU_BOOK;
+  return null;
+}
+
+/**
+ * Reload book từ file (gọi sau khi user upload file mới)
+ */
+function reloadLc79Book() {
+  LC79_MD5_BOOK = loadJson(LC79_MD5_FILE, null);
+  LC79_HU_BOOK  = loadJson(LC79_HU_FILE,  null);
+  log(`[LC79] Book reloaded: md5=${LC79_MD5_BOOK?.book ? Object.keys(LC79_MD5_BOOK.book).length : 0} md5-keys, hu=${LC79_HU_BOOK?.book ? Object.keys(LC79_HU_BOOK.book).length : 0} hu-keys`);
+}
+
+// ═══════════════════════════════════════════════════════════
+// BOOK MARKOV PREDICTOR (bậc 1-9)
+// ═══════════════════════════════════════════════════════════
+/**
+ * Dự đoán từ book transition matrix có sẵn (bậc cao → thấp)
+ * @param {string[]} historyArr - mảng ký tự T/X (mới nhất ở [0])
+ * @param {object}   book       - { "XTT": {T:..,X:..,count:..}, ... }
+ * @returns {object}            - { detected, prediction, confidence, order, pattern, sampleSize, name }
+ */
+function predictFromBook(historyArr, book) {
+  if (!historyArr || historyArr.length < 3 || !book) return { detected: false };
+
+  // Thử bậc cao → thấp (9 → 1)
+  for (let order = Math.min(9, historyArr.length - 1); order >= 1; order--) {
+    // Lấy `order` ký tự gần nhất, đảo vì historyArr[0] là mới nhất
+    const pattern = historyArr.slice(0, order).reverse().join('');
+    const entry   = book[pattern];
+    if (!entry || entry.count < ANTI_LOSS_V2.BOOK_MIN_SAMPLE) continue;
+
+    const tCount = entry.T || 0;
+    const xCount = entry.X || 0;
+    const total  = entry.count || (tCount + xCount);
+    if (total === 0) continue;
+
+    const pT = tCount / total;
+    const pX = xCount / total;
+    const prob = Math.max(pT, pX);
+    const pred = pT >= pX ? 'Tài' : 'Xỉu';
+
+    // Confidence: 55-92% dựa vào prob
+    const conf = Math.round(55 + prob * 40);
+    if (conf < ANTI_LOSS_V2.BOOK_MIN_CONFIDENCE) continue;
+
+    return {
+      detected  : true,
+      prediction: pred,
+      confidence: clamp(conf, 55, 92),
+      order,
+      pattern,
+      sampleSize: total,
+      name: `Book Markov bậc ${order} [${pattern}] → ${pred} (${(prob * 100).toFixed(1)}%)`,
+      patternId: 'book_markov',
+    };
+  }
+  return { detected: false };
+}
+
+/**
+ * Phát hiện cầu bệt dài từ history (>=6 liên tiếp)
+ * → ưu tiên BẺ (xác suất bẻ cao khi cầu đã dài)
+ */
+function detectLongStreakFromBook(historyArr, book) {
+  if (!historyArr || historyArr.length < 5) return { detected: false };
+
+  const first = historyArr[0];
+  let streak = 1;
+  for (let i = 1; i < historyArr.length; i++) {
+    if (historyArr[i] === first) streak++;
+    else break;
+  }
+
+  if (streak < ANTI_LOSS_V2.BOOK_LONG_STREAK_THRESHOLD) return { detected: false };
+
+  // Tra book với pattern toàn first (vd "TTTTT")
+  const pattern = first.repeat(Math.min(streak, 5));
+  const entry   = book?.[pattern];
+  let breakProb = 0.5;
+  let sampleSize = 0;
+  if (entry && entry.count > 0) {
+    sampleSize = entry.count;
+    const sameCount = entry[first === 'T' ? 'T' : 'X'] || 0;
+    breakProb = 1 - (sameCount / entry.count);
+  }
+
+  // streak càng dài → breakProb càng cao
+  const streakBoost = Math.min((streak - 5) * 0.08, 0.35);
+  const finalProb   = clamp(breakProb + streakBoost, 0.5, 0.95);
+
+  // Nếu streak >= 8 → force bẻ bất kể book
+  const forceBreak = streak >= 8;
+
+  if (finalProb < 0.55 && !forceBreak) return { detected: false };
+
+  const pred = first === 'T' ? 'Xỉu' : 'Tài';
+  const conf = Math.round(55 + finalProb * 35);
+
+  return {
+    detected   : true,
+    prediction : pred,
+    confidence : clamp(conf, 55, 92),
+    streak,
+    streakChar : first,
+    breakProb  : (finalProb * 100).toFixed(1),
+    sampleSize,
+    forceBreak,
+    name: `Cầu Bệt ${streak} ${first === 'T' ? 'Tài' : 'Xỉu'} → BẺ sang ${pred} (breakProb ${(finalProb * 100).toFixed(1)}%)`,
+    patternId: 'book_long_streak',
+  };
+}
+
+/**
+ * Phân tích history 100 phiên (bias, tỉ lệ)
+ */
+function analyzeHistoryBias(historyArr) {
+  if (!historyArr || historyArr.length < 20) return { detected: false };
+  const tCount = historyArr.filter(x => x === 'T').length;
+  const xCount = historyArr.length - tCount;
+  const pT = tCount / historyArr.length;
+  const pX = xCount / historyArr.length;
+  const maxP = Math.max(pT, pX);
+  const biasSide = pT > pX ? 'Tài' : 'Xỉu';
+
+  // Bias yếu → không dùng
+  if (maxP < 0.58) return { detected: false };
+
+  return {
+    detected: true,
+    prediction: biasSide === 'Tài' ? 'Tài' : 'Xỉu',
+    confidence: clamp(Math.round(50 + maxP * 40), 55, 78),
+    biasSide,
+    biasPct: (maxP * 100).toFixed(1),
+    tCount, xCount, total: historyArr.length,
+    name: `History Bias ${biasSide} ${(maxP * 100).toFixed(1)}% (${tCount}T/${xCount}X)`,
+    patternId: 'book_history_bias',
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
 // ANTI-LOSS STATE
 // ═══════════════════════════════════════════════════════════
 const ANTI_LOSS_STATE = new Map();
@@ -272,7 +408,6 @@ function getAntiLossState(key) {
       lastPhien: null, lastCauType: null, cauBreakCount: 0,
       lastCauSignature: null,
       pendingSignature: null,
-      // v11: Anti-streak lock
       antiStreakLock: false,
       antiStreakCooldown: 0,
       lastReverseAt: null,
@@ -291,7 +426,6 @@ function ensureV2Fields(s) {
   if (s.cauBreakCount == null)             s.cauBreakCount = 0;
   if (s.lastCauSignature == null)          s.lastCauSignature = null;
   if (s.pendingSignature == null)          s.pendingSignature = null;
-  // v11
   if (s.antiStreakLock == null)            s.antiStreakLock = false;
   if (s.antiStreakCooldown == null)        s.antiStreakCooldown = 0;
   if (s.lastReverseAt == null)             s.lastReverseAt = null;
@@ -307,7 +441,6 @@ function updateAntiLossState(key, predicted, actual, phien) {
   if (s.recentResults.length > 30) s.recentResults.shift();
   s.lastPhien = phien;
 
-  // HỌC CẦU
   if (s.pendingSignature) {
     learnCau(s.pendingSignature, predicted, actual, s.lastCauType);
     log(`[LEARN] 📚 Cầu ${s.pendingSignature} | ${predicted}→${actual} | ${isCorrect ? 'ĐÚNG' : 'SAI'}`);
@@ -319,12 +452,11 @@ function updateAntiLossState(key, predicted, actual, phien) {
     s.hardStopActive = false;
     s.forceReverseCooldown = Math.max(0, s.forceReverseCooldown - 1);
     s.consecutiveCorrectAfterReverse++;
-    // Giải phóng anti-streak lock nếu đúng 1 lần
     if (s.antiStreakLock) {
       s.antiStreakCooldown = Math.max(0, s.antiStreakCooldown - 1);
       if (s.antiStreakCooldown === 0) {
         s.antiStreakLock = false;
-        log(`[V11] ✅ ANTI-STREAK UNLOCK ${key}`);
+        log(`[V12] ✅ ANTI-STREAK UNLOCK ${key}`);
       }
     }
     if (s.recoveryMode) {
@@ -338,14 +470,13 @@ function updateAntiLossState(key, predicted, actual, phien) {
     s.consecutiveWin = 0; s.consecutiveLoss++;
     s.consecutiveCorrectAfterReverse = 0;
 
-    // v11: ANTI-STREAK LOCK khi thua 2
     if (s.consecutiveLoss >= ANTI_LOSS.HARD_STOP_AT) {
       s.hardStopActive = true;
       s.hardStopCooldown = 3;
       s.hardStopConfirmWinsNeeded = 2;
       s.antiStreakLock = true;
       s.antiStreakCooldown = ANTI_LOSS.COOLDOWN_PHIEN;
-      log(`[V11] 🛑 ANTI-STREAK LOCK ${key} - SAI ${s.consecutiveLoss} LIÊN TIẾP! ĐẢO TRIỆT ĐỂ ${ANTI_LOSS.COOLDOWN_PHIEN} PHIÊN`);
+      log(`[V12] 🛑 ANTI-STREAK LOCK ${key} - SAI ${s.consecutiveLoss} LIÊN TIẾP! ĐẢO TRIỆT ĐỂ ${ANTI_LOSS.COOLDOWN_PHIEN} PHIÊN`);
     }
   }
 
@@ -400,7 +531,7 @@ function recordPredictionHistory(gameKey, phienTruoc, result, phienNay, duDoan, 
 }
 
 // ═══════════════════════════════════════════════════════════
-// CẦU DETECTION (giữ nguyên + thêm metadata cho GATE)
+// CẦU DETECTION (v11 giữ nguyên)
 // ═══════════════════════════════════════════════════════════
 function detectCauType(results) {
   if (!results || results.length < 4) {
@@ -408,7 +539,6 @@ function detectCauType(results) {
   }
   const r = results, N = r.length;
 
-  // Bệt
   let streak = 1;
   for (let i = 1; i < N; i++) { if (r[i] === r[0]) streak++; else break; }
   if (streak >= 6) {
@@ -426,7 +556,6 @@ function detectCauType(results) {
       patternId: 'cau_bet', shouldBreak, cauDirection: pred, gate1Pass: streak >= ANTI_LOSS_V2.GATE1_MIN_CAU_LEN };
   }
 
-  // Đảo 1-1
   let alt = 1;
   for (let i = 1; i < N; i++) { if (r[i] !== r[i - 1]) alt++; else break; }
   if (alt >= 4 && alt <= ANTI_LOSS_V2.CAU_MAX_LENGTH) {
@@ -438,7 +567,6 @@ function detectCauType(results) {
       patternId: 'cau_dao_11', shouldBreak, cauDirection: pred, gate1Pass: alt >= ANTI_LOSS_V2.GATE1_MIN_CAU_LEN };
   }
 
-  // 2-2
   if (N >= 6) {
     let pairs = 0, i = 0;
     while (i < N - 1 && pairs < 5) { if (r[i] === r[i + 1]) { pairs++; i += 2; } else break; }
@@ -451,7 +579,6 @@ function detectCauType(results) {
     }
   }
 
-  // 3-3
   if (N >= 6) {
     let triples = 0, i = 0;
     while (i < N - 2 && triples < 4) {
@@ -466,21 +593,18 @@ function detectCauType(results) {
     }
   }
 
-  // 1-2-1
   if (N >= 4 && r[0] !== r[1] && r[1] === r[2] && r[2] !== r[3] && r[0] === r[3]) {
     return { detected: true, type: 'cau121', length: 4, predict: r[1],
       confidence: 72, name: 'Cầu 1-2-1', patternId: 'cau_121',
       shouldBreak: false, cauDirection: r[1], gate1Pass: true };
   }
 
-  // 2-1-2
   if (N >= 5 && r[0] === r[1] && r[1] !== r[2] && r[2] !== r[3] && r[3] === r[4]) {
     return { detected: true, type: 'cau212', length: 5, predict: r[0],
       confidence: 73, name: 'Cầu 2-1-2', patternId: 'cau_212',
       shouldBreak: false, cauDirection: r[0], gate1Pass: true };
   }
 
-  // 1-2-3
   if (N >= 6) {
     const p = r.slice(0, 6).reverse();
     if (p[0] !== p[1] && p[1] === p[2] && p[2] === p[3] && p[3] !== p[4] && p[4] === p[5]) {
@@ -491,7 +615,6 @@ function detectCauType(results) {
     }
   }
 
-  // 3-2-1
   if (N >= 6) {
     const p = r.slice(0, 6).reverse();
     if (p[0] === p[1] && p[1] === p[2] && p[3] === p[4] && p[2] !== p[3] && p[4] !== p[5]) {
@@ -502,7 +625,6 @@ function detectCauType(results) {
     }
   }
 
-  // Nhảy cóc
   if (N >= 6 && r[0] === r[2] && r[2] === r[4] && r[1] === r[3] && r[3] === r[5] && r[0] !== r[1]) {
     return { detected: true, type: 'cau_nhay_coc', length: 6, predict: r[4],
       confidence: 76, name: 'Cầu Nhảy Cóc', patternId: 'cau_nhay_coc',
@@ -524,22 +646,17 @@ function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
   let reversed = false;
   let memoryStrength = 0;
 
-  // ƯU TIÊN 1: memory đảo
   if (memory.shouldReverse) {
     finalPred = memory.reverseTo;
     reason = memory.reason;
     reversed = true;
     memoryStrength = memory.strength || 0;
     log(`[CAU-MEM] 🔄 ${key} ${reason} (strength=${memoryStrength})`);
-  }
-  // ƯU TIÊN 2: cầu dài → bẻ
-  else if (cauInfo.shouldBreak) {
+  } else if (cauInfo.shouldBreak) {
     finalPred = cauInfo.cauDirection || (cauInfo.predict === 'Tài' ? 'Xỉu' : 'Tài');
     reason = `Cầu ${cauInfo.type} dài → BẺ: ${finalPred}`;
     reversed = true;
-  }
-  // ƯU TIÊN 3: theo cầu
-  else {
+  } else {
     finalPred = cauInfo.predict;
   }
 
@@ -559,7 +676,7 @@ function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// PREDICTION ENGINE — CÁC LỚP PHÂN TÍCH
+// MARKOV / ANALYSIS (v11 giữ nguyên)
 // ═══════════════════════════════════════════════════════════
 function buildMarkovChain(results, maxOrder = 5) {
   const chain = Object.create(null);
@@ -685,16 +802,10 @@ function checkEntropyWarning(results) {
   return null;
 }
 
-/**
- * v11: NO-EDGE DETECTOR (GATE 1 của form v2.0)
- * Trả về true nếu rơi vào vùng nhiễu → confidence = 50%
- */
 function isNoEdgeZone(results, cauInfo) {
   if (!results || results.length < 10) return false;
   const e = calcEntropy(results, 20);
-  // Entropy cao + không có cầu rõ → nhiễu
   if (e > 0.93 && (!cauInfo.detected || cauInfo.length < ANTI_LOSS_V2.GATE1_MIN_CAU_LEN)) return true;
-  // 6 phiên gần nhất không có pattern lặp
   const r6 = results.slice(0, 6);
   let changes = 0;
   for (let i = 1; i < r6.length; i++) if (r6[i] !== r6[i-1]) changes++;
@@ -702,9 +813,6 @@ function isNoEdgeZone(results, cauInfo) {
   return false;
 }
 
-/**
- * v11: GATE 3 — Điểm số xác nhận (nếu có dữ liệu tổng)
- */
 function evaluateGate3(data, prediction) {
   if (!data || data.length < 5) return { pass: true, score: 0, reason: 'Không có data điểm' };
   const sums = data.slice(0, 10).map(d => {
@@ -727,11 +835,11 @@ function evaluateGate3(data, prediction) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ENGINE CHÍNH v11 — KHÔNG SKIP
+// ENGINE CHÍNH v12 — TÍCH HỢP BOOK
 // ═══════════════════════════════════════════════════════════
 function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   if (!data || data.length === 0) {
-    return { action: 'BET', prediction: 'Tài', confidence: 50, phienPhanTich: null, phienDoan: null, factors: ['Default'], cau: null, warning: null, noEdge: false, gates: {} };
+    return { action: 'BET', prediction: 'Tài', confidence: 50, phienPhanTich: null, phienDoan: null, factors: ['Default'], cau: null, warning: null, noEdge: false, gates: {}, book: null };
   }
 
   const last50  = data.slice(0, 50);
@@ -743,6 +851,31 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   const chain = buildMarkovChain(results, 5);
   const signals = [];
 
+  // ═══ v12: BOOK SIGNALS (ưu tiên cao nhất) ═══
+  const bookData = loadLc79Book(type);
+  let bookSignal = null;
+  let longStreakSignal = null;
+  let biasSignal = null;
+
+  if (bookData?.book && bookData?.history?.length >= 3) {
+    // 1) Book Markov bậc 1-9
+    bookSignal = predictFromBook(bookData.history, bookData.book);
+    if (bookSignal.detected) {
+      signals.push({ ...bookSignal, priority: ANTI_LOSS_V2.BOOK_PRIORITY, weight: 2.2 });
+    }
+    // 2) Long streak detector
+    longStreakSignal = detectLongStreakFromBook(bookData.history, bookData.book);
+    if (longStreakSignal.detected) {
+      signals.push({ ...longStreakSignal, priority: ANTI_LOSS_V2.BOOK_PRIORITY - 2, weight: 2.0 });
+    }
+    // 3) History bias
+    biasSignal = analyzeHistoryBias(bookData.history);
+    if (biasSignal.detected) {
+      signals.push({ ...biasSignal, priority: 8, weight: 1.2 });
+    }
+  }
+
+  // ═══ v11 signals (giữ nguyên) ═══
   const push = (res, priority, weight) => { if (res.detected) signals.push({ ...res, priority, weight }); };
   push(predictMarkov(results, chain),  16, 2.0);
   push(analyzeEntropy(results),        15, 1.6);
@@ -779,20 +912,44 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   const cauResult = checkCauAndBreak(antiLossKey, cauInfo, finalPred, results, state);
   const factors   = [];
 
+  // v12: Book signal được ưu tiên nếu confidence cao hơn cầu
+  if (bookSignal?.detected && bookSignal.confidence >= 65) {
+    if (bookSignal.prediction !== finalPred) {
+      // book override nếu mạnh
+      finalPred = bookSignal.prediction;
+      baseConf = Math.max(baseConf, bookSignal.confidence);
+      factors.unshift(`📚 BOOK: ${bookSignal.name}`);
+    }
+  }
+
   if (cauResult.action === 'BET' && cauInfo.detected && (cauInfo.confidence >= 60 || cauResult.cau?.reversed)) {
     finalPred = cauResult.prediction;
     baseConf  = Math.max(baseConf, cauInfo.confidence);
     factors.unshift(cauResult.reason);
   }
 
-  // ═══ v11: GATE 1 — NO-EDGE ZONE ═══
+  // v12: Long streak override — cầu bệt dài phải bẻ
+  if (longStreakSignal?.detected) {
+    if (longStreakSignal.prediction !== finalPred) {
+      finalPred = longStreakSignal.prediction;
+      baseConf = Math.max(baseConf, longStreakSignal.confidence);
+      factors.unshift(`🔥 LONG STREAK: ${longStreakSignal.name}`);
+    }
+    if (longStreakSignal.forceBreak) {
+      finalPred = longStreakSignal.prediction;
+      baseConf = Math.max(baseConf, 75);
+      factors.unshift(`⚡ FORCE BREAK (streak ${longStreakSignal.streak} >= 8)`);
+    }
+  }
+
+  // GATE 1
   const noEdge = isNoEdgeZone(results, cauInfo);
   if (noEdge) {
     baseConf = Math.min(baseConf, ANTI_LOSS.WEAK_SIGNAL_CONF);
     factors.push('Vùng nhiễu (no-edge) → confidence thấp');
   }
 
-  // ═══ v11: GATE 3 — ĐIỂM SỐ XÁC NHẬN ═══
+  // GATE 3
   const gate3 = evaluateGate3(data, finalPred);
   if (!gate3.pass && gate3.score < 0) {
     baseConf = Math.max(ANTI_LOSS.MIN_CONFIDENCE, baseConf - 10);
@@ -806,14 +963,13 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   const floor   = ANTI_LOSS_V2.CONFIDENCE_FLOOR_BY_LOSS[Math.min(state.consecutiveLoss, 4)] || 50;
   if (finalConf < floor) finalConf = floor;
 
-  // ═══ v11: ANTI-STREAK LOCK — NẾU ĐANG LOCKED, ĐẢO TRIỆT ĐỂ ═══
+  // ANTI-STREAK LOCK
   if (state.antiStreakLock && state.antiStreakCooldown > 0) {
     finalPred = finalPred === 'Tài' ? 'Xỉu' : 'Tài';
-    finalConf = Math.max(72, finalConf); // tăng confidence vì đảo triệt để
+    finalConf = Math.max(72, finalConf);
     factors.unshift(`🔒 ANTI-STREAK LOCK (thua ${state.consecutiveLoss}): ĐẢO → ${finalPred}`);
-    log(`[V11] 🔒 ANTI-STREAK REVERSE → ${finalPred} (conf=${finalConf}%)`);
+    log(`[V12] 🔒 ANTI-STREAK REVERSE → ${finalPred} (conf=${finalConf}%)`);
   }
-  // Force reverse thông thường khi thua 2
   else if (state.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT) {
     finalPred = finalPred === 'Tài' ? 'Xỉu' : 'Tài';
     finalConf = Math.min(82, finalConf + 8);
@@ -822,7 +978,6 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
     log(`[V2] 🔄 FORCE REVERSE → ${finalPred}`);
   }
 
-  // Memory đảo mạnh → tăng confidence
   if (cauResult.cau?.reversed && cauResult.cau?.memoryStrength >= 2) {
     finalConf = Math.min(ANTI_LOSS.MAX_CONFIDENCE, finalConf + 6);
     factors.push(`Memory đảo mạnh (strength=${cauResult.cau.memoryStrength})`);
@@ -840,10 +995,8 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
     finalConf = Math.max(ANTI_LOSS.MIN_CONFIDENCE, finalConf - 8);
   }
 
-  // v11: KHÔNG BAO GIỜ DƯỚI 50
   finalConf = clamp(Math.round(finalConf), ANTI_LOSS.MIN_CONFIDENCE, ANTI_LOSS.MAX_CONFIDENCE);
 
-  // v11: NẾU NO-EDGE HOẶC CONF < 55 → trả 50% (theo yêu cầu "skip vẫn dự đoán nhưng tỉ lệ 50%")
   let weakSignal = false;
   if (noEdge || finalConf < 55) {
     finalConf = ANTI_LOSS.WEAK_SIGNAL_CONF;
@@ -864,11 +1017,20 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   return {
     action: 'BET', prediction: finalPred, confidence: finalConf,
     phienPhanTich: phienHT, phienDoan,
-    factors: factors.slice(0, 4),
+    factors: factors.slice(0, 6),
     cau: cauResult.cau,
     warning,
     noEdge,
     weakSignal,
+    book: bookSignal?.detected ? {
+      pattern: bookSignal.pattern, order: bookSignal.order,
+      sampleSize: bookSignal.sampleSize, prediction: bookSignal.prediction,
+      confidence: bookSignal.confidence,
+    } : null,
+    longStreak: longStreakSignal?.detected ? {
+      streak: longStreakSignal.streak, streakChar: longStreakSignal.streakChar,
+      breakProb: longStreakSignal.breakProb, forceBreak: longStreakSignal.forceBreak,
+    } : null,
     gates: {
       gate1: { pass: !noEdge, reason: noEdge ? 'Vùng nhiễu' : 'Có cầu rõ' },
       gate2: { pass: state.consecutiveLoss < 2, lossStreak: state.consecutiveLoss, antiStreakLock: state.antiStreakLock },
@@ -883,7 +1045,7 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
 }
 
 // ═══════════════════════════════════════════════════════════
-// COMPACT RESPONSE — GIỮ NGUYÊN SCHEMA
+// COMPACT RESPONSE — GIỮ NGUYÊN SCHEMA v11
 // ═══════════════════════════════════════════════════════════
 function buildCompactResponse(data, result) {
   const first   = data?.[0] ?? {};
@@ -926,15 +1088,20 @@ function exportReport(format = 'json', outPath = null) {
           .slice(0, 20)
           .map(([sig, m]) => ({ signature: sig, ...m })),
       },
+      lc79Book: {
+        md5: LC79_MD5_BOOK?.book ? { historyLen: LC79_MD5_BOOK.history?.length || 0, bookKeys: Object.keys(LC79_MD5_BOOK.book).length } : null,
+        hu:  LC79_HU_BOOK?.book  ? { historyLen: LC79_HU_BOOK.history?.length  || 0, bookKeys: Object.keys(LC79_HU_BOOK.book).length  } : null,
+      },
       history: HISTORY_DUDOAN_STORE.slice(0, 100),
     }, null, 2);
   } else {
     const lines = [
-      `=== BÁO CÁO DỰ ĐOÁN TÀI XỈU AI v11 (KHÔNG SKIP) ===`,
+      `=== BÁO CÁO DỰ ĐOÁN TÀI XỈU AI v12 (BOOK TÍCH HỢP) ===`,
       `Thời gian: ${new Date().toISOString()}`,
       `Tổng phiên: ${total} | Thắng: ${wins} | Thua: ${losses} | Tỉ lệ: ${winRate}%`,
       `Hôm nay: Thắng ${DAILY_TRACKER.totalWin} | Thua ${DAILY_TRACKER.totalLoss}`,
       `Cầu memory: ${Object.keys(CAU_MEMORY).length} signature`,
+      `LC79 MD5 book: ${LC79_MD5_BOOK?.book ? Object.keys(LC79_MD5_BOOK.book).length : 0} patterns`,
       ``,
       `--- 20 PHIÊN GẦN NHẤT ---`,
       ...HISTORY_DUDOAN_STORE.slice(0, 20).map(h =>
@@ -951,7 +1118,7 @@ function exportReport(format = 'json', outPath = null) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// WORKERS (GIỮ NGUYÊN TỪ v10)
+// WORKERS (giữ nguyên v11)
 // ═══════════════════════════════════════════════════════════
 function workerGeightdors(gameId, platformId, table, gid, isMd5) {
   const url = `https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=${platformId}&gid=${gid}`;
@@ -1292,7 +1459,7 @@ function autoVerifyLoop() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HTML UI (giữ nguyên v10 + update title v11)
+// HTML UI (giữ nguyên v11 + update title v12)
 // ═══════════════════════════════════════════════════════════
 const TOOL_HTML = `<!DOCTYPE html>
 <html lang="vi">
@@ -1302,7 +1469,7 @@ const TOOL_HTML = `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0a0e27">
-<title>Tài Xỉu AI v11</title>
+<title>Tài Xỉu AI v12 — BOOK</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#fff;min-height:100vh;padding:12px;padding-bottom:80px;overflow-x:hidden}
@@ -1340,11 +1507,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .h-item.tai{background:rgba(0,255,136,0.2);color:#00ff88}.h-item.xiu{background:rgba(255,85,119,0.2);color:#ff5577}
 .warning-box{background:rgba(255,200,0,0.1);border:1px solid #ffc800;border-radius:8px;padding:8px 12px;font-size:11px;color:#ffc800;margin-top:8px}
 .cau-box{background:rgba(0,204,255,0.1);border:1px solid #00ccff;border-radius:8px;padding:8px 12px;font-size:11px;color:#00ccff;margin-top:8px}
+.book-box{background:rgba(0,255,136,0.1);border:1px solid #00ff88;border-radius:8px;padding:8px 12px;font-size:11px;color:#00ff88;margin-top:8px}
+.streak-box{background:rgba(255,0,100,0.15);border:1px solid #ff0064;border-radius:8px;padding:8px 12px;font-size:11px;color:#ff0064;margin-top:8px;font-weight:700}
 .lock-box{background:rgba(255,85,119,0.15);border:1px solid #ff5577;border-radius:8px;padding:8px 12px;font-size:11px;color:#ff5577;margin-top:8px;font-weight:700}
 </style>
 </head>
 <body>
-<div class="header"><h1>🎲 TÀI XỈU AI v11</h1><div class="sub">KHÔNG SKIP | Anti-Streak | @tranhoang2286</div></div>
+<div class="header"><h1>🎲 TÀI XỈU AI v12</h1><div class="sub">BOOK MARKOV | Anti-Streak | @tranhoang2286</div></div>
 <div class="card">
 <div class="game-info"><div class="game-name" id="gameName">LC79 HŨ</div><div class="phien-info" id="phienInfo">Phiên: ---</div></div>
 <div class="kq-display">
@@ -1358,6 +1527,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="pred-value" id="predValue">---</div>
 <div class="pred-rate" id="predRate">0%</div>
 </div>
+<div id="bookBox"></div>
+<div id="streakBox"></div>
 <div id="cauBox"></div>
 <div id="lockBox"></div>
 <div id="warningBox"></div>
@@ -1389,6 +1560,8 @@ let currentGame = 'lc79/hu', isOnline = false;
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
 function switchGame(){currentGame=document.getElementById('gameSelect').value;const names={'lc79/hu':'LC79 HŨ','lc79/md5':'LC79 MD5','b52/hu':'B52 HŨ','b52/md5':'B52 MD5','hitclub/hu':'HITCLUB HŨ','hitclub/md5':'HITCLUB MD5','betvip/hu':'BETVIP HŨ','betvip/md5':'BETVIP MD5','rikvip/hu':'RIKVIP HŨ','sunwin/main':'SUNWIN','68gb/hu':'68GB HŨ','68gb/md5':'68GB MD5','luck8/txhu':'LUCK8 HŨ','luck8/txmd5':'LUCK8 MD5','sumclub/hu':'SUMCLUB HŨ','789club/live':'789CLUB LIVE','789club/minigame':'789CLUB MINI'};document.getElementById('gameName').textContent=names[currentGame]||currentGame;doPredict();}
 async function doPredict(){const btn=document.getElementById('btnPredict'),loading=document.getElementById('loading');btn.disabled=true;loading.style.display='block';try{const[game,table]=currentGame.split('/');const res=await fetch(API_BASE+'/api/predict/'+game+'/'+table,{cache:'no-store'});const data=await res.json();document.getElementById('valPhien').textContent=data.phien||'---';document.getElementById('valPhienDoan').textContent=data.phienDoan||'---';document.getElementById('valTong').textContent=data.tong!=null?data.tong:'---';document.getElementById('phienInfo').textContent='Phiên: '+(data.phien||'---');const kqEl=document.getElementById('valKetQua');kqEl.textContent=data.ketQua||'---';kqEl.className='value '+(data.ketQua==='Tài'?'tai':data.ketQua==='Xỉu'?'xiu':'');const predBox=document.getElementById('predBox'),predValue=document.getElementById('predValue'),predRate=document.getElementById('predRate');if(data.duDoan==='Tài'||data.duDoan==='Xỉu'){predValue.textContent=data.duDoan;predValue.className='pred-value '+(data.duDoan==='Tài'?'tai':'xiu');predBox.className='prediction-box '+(data.duDoan==='Xỉu'?'xiu':'')+(data.tiLe==='50%'?' weak':'');predRate.textContent=data.tiLe||'0%';const hist=JSON.parse(localStorage.getItem('history_'+currentGame)||'[]');hist.unshift({phien:data.phienDoan,duDoan:data.duDoan,tiLe:data.tiLe});if(hist.length>10)hist.length=10;localStorage.setItem('history_'+currentGame,JSON.stringify(hist));renderHistory();}else{predValue.textContent='---';predValue.className='pred-value';predRate.textContent='0%';}
+const bb=document.getElementById('bookBox');if(data.book){bb.innerHTML='<div class="book-box">📚 BOOK bậc '+data.book.order+' ['+data.book.pattern+'] (n='+data.book.sampleSize+') → '+data.book.prediction+' ('+data.book.confidence+'%)</div>';}else bb.innerHTML='';
+const sb=document.getElementById('streakBox');if(data.longStreak){sb.innerHTML='<div class="streak-box">🔥 CẦU BỆT '+data.longStreak.streak+' '+data.longStreak.streakChar+(data.longStreak.forceBreak?' [FORCE BREAK]':'')+' — breakProb '+data.longStreak.breakProb+'%</div>';}else sb.innerHTML='';
 const cb=document.getElementById('cauBox');if(data.cau&&data.cau.name){let txt='🎯 '+data.cau.name;if(data.cau.reversed)txt+=' [ĐẢO]';if(data.cau.memoryStats)txt+=' | Mem: '+data.cau.memoryStats.correct+'/'+data.cau.memoryStats.total+' ('+data.cau.memoryStats.winRate+'%)';cb.innerHTML='<div class="cau-box">'+txt+'</div>';}else cb.innerHTML='';
 const lb=document.getElementById('lockBox');if(data.antiStreak&&data.antiStreak.locked){lb.innerHTML='<div class="lock-box">🔒 ANTI-STREAK LOCK: Thua '+data.antiStreak.consecutiveLoss+' liên tiếp → ĐẢO TRIỆT ĐỂ (cooldown '+data.antiStreak.cooldown+' phiên)</div>';}else lb.innerHTML='';
 const wb=document.getElementById('warningBox');let warnHtml='';if(data.warning)warnHtml+='<div class="warning-box">'+data.warning+'</div>';if(data.tiLe==='50%')warnHtml+='<div class="warning-box">⚠ Tín hiệu yếu / vùng nhiễu → trả 50% (vẫn dự đoán, không skip)</div>';wb.innerHTML=warnHtml;isOnline=true;updateStatus();}catch(err){showToast('Lỗi: '+err.message);isOnline=false;updateStatus();}finally{btn.disabled=false;loading.style.display='none';}}
@@ -1404,7 +1577,7 @@ window.addEventListener('load',()=>{switchGame();updateStatus();});
 // EXPRESS APP
 // ═══════════════════════════════════════════════════════════
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin',  '*');
@@ -1421,14 +1594,14 @@ app.get('/',          (_, res) => res.type('html').send(TOOL_HTML));
 app.get('/tool',      (_, res) => res.type('html').send(TOOL_HTML));
 app.get('/index.html',(_, res) => res.type('html').send(TOOL_HTML));
 
-app.get('/health', (_, res) => res.json({ status: 'ok', service: 'taixiu-ai-v11', idol: '@tranhoang2286', uptime: process.uptime(), memory: process.memoryUsage(), port: PORT, host: HOST }));
+app.get('/health', (_, res) => res.json({ status: 'ok', service: 'taixiu-ai-v12', idol: '@tranhoang2286', uptime: process.uptime(), memory: process.memoryUsage(), port: PORT, host: HOST }));
 
 app.get('/api/info', (_, res) => {
   const ips = [];
   for (const nets of Object.values(os.networkInterfaces())) {
     for (const net of nets) { if (net.family === 'IPv4' && !net.internal) ips.push(net.address); }
   }
-  res.json({ status: 'ok', port: PORT, host: HOST, localIPs: ips, urls: ['http://localhost:' + PORT, ...ips.map(ip => `http://${ip}:${PORT}`)], idol: '@tranhoang2286' });
+  res.json({ status: 'ok', port: PORT, host: HOST, localIPs: ips, urls: ['http://localhost:' + PORT, ...ips.map(ip => `http://${ip}:${PORT}`)], idol: '@tranhoang2286', version: '12.0.0' });
 });
 
 app.get('/api/games', (_, res) => {
@@ -1482,11 +1655,48 @@ app.delete('/api/cau/memory/:signature', (req, res) => {
   }
 });
 
+// ═══ v12: LC79 BOOK API ═══
+app.get('/api/book/:table', (req, res) => {
+  const table = req.params.table;
+  const bookData = loadLc79Book(table);
+  if (!bookData?.book) return res.status(404).json({ error: 'NO_BOOK', table, hint: `Upload lc79_${table}.json vào ${DATA_DIR}` });
+  res.json({
+    table,
+    historyLen: bookData.history?.length || 0,
+    bookKeys  : Object.keys(bookData.book).length,
+    history   : bookData.history || [],
+    book      : bookData.book,
+  });
+});
+
+app.post('/api/book/reload', (_, res) => {
+  reloadLc79Book();
+  res.json({
+    status: 'ok',
+    md5: LC79_MD5_BOOK?.book ? { historyLen: LC79_MD5_BOOK.history?.length || 0, bookKeys: Object.keys(LC79_MD5_BOOK.book).length } : null,
+    hu:  LC79_HU_BOOK?.book  ? { historyLen: LC79_HU_BOOK.history?.length  || 0, bookKeys: Object.keys(LC79_HU_BOOK.book).length  } : null,
+  });
+});
+
+app.post('/api/book/upload/:table', (req, res) => {
+  try {
+    const table = req.params.table;
+    if (table !== 'md5' && table !== 'hu') return res.status(400).json({ error: 'INVALID_TABLE' });
+    const body = req.body;
+    if (!body?.history || !body?.book) return res.status(400).json({ error: 'INVALID_FORMAT', hint: 'Cần { history: [...], book: {...} }' });
+    const file = table === 'md5' ? LC79_MD5_FILE : LC79_HU_FILE;
+    saveJson(file, body);
+    reloadLc79Book();
+    res.json({ status: 'ok', table, historyLen: body.history.length, bookKeys: Object.keys(body.book).length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ENDPOINT CHÍNH — KHÔNG BAO GIỜ SKIP
 app.get('/api/predict/:game/:table', async (req, res) => {
   try {
     const { game, table } = req.params;
-    // v11: bỏ mode conservative — luôn aggressive (không skip)
     let data = DATA_STORE[game]?.[table];
 
     if (game === 'lc79') {
@@ -1495,25 +1705,26 @@ app.get('/api/predict/:game/:table', async (req, res) => {
     }
 
     if (!data || data.length === 0) {
-      // v11: vẫn trả dự đoán mặc định 50%
       return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
     }
 
     const key    = `${game}_${table}`;
-    const result = calculatePrediction(data, key, key, 'aggressive');
+    const result = calculatePrediction(data, table, key, 'aggressive');
 
     if (result.phienDoan != null) {
       LAST_PREDICTION.set(key, { phien: result.phienDoan, currentPhien: result.phienPhanTich, prediction: result.prediction, confidence: result.confidence });
     }
 
     const resp = buildCompactResponse(data, result);
-    // v11: thêm meta (không ảnh hưởng schema chính)
-    if (result.warning) resp.warning = result.warning;
-    if (result.cau) resp.cau = result.cau;
-    if (result.noEdge) resp.noEdge = true;
+    if (result.warning)   resp.warning   = result.warning;
+    if (result.cau)       resp.cau       = result.cau;
+    if (result.book)      resp.book      = result.book;
+    if (result.longStreak) resp.longStreak = result.longStreak;
+    if (result.noEdge)    resp.noEdge    = true;
     if (result.weakSignal) resp.weakSignal = true;
     if (result.antiStreak) resp.antiStreak = result.antiStreak;
-    if (result.gates) resp.gates = result.gates;
+    if (result.gates)     resp.gates     = result.gates;
+    if (result.factors)   resp.factors   = result.factors;
     res.json(resp);
   } catch (e) {
     logError('[API predict]', e);
@@ -1533,7 +1744,9 @@ app.get('/predict/:type', async (req, res) => {
       LAST_PREDICTION.set(key, { phien: result.phienDoan, currentPhien: result.phienPhanTich, prediction: result.prediction, confidence: result.confidence });
     }
     const resp = buildCompactResponse(data, result);
-    if (result.cau) resp.cau = result.cau;
+    if (result.cau)        resp.cau        = result.cau;
+    if (result.book)       resp.book       = result.book;
+    if (result.longStreak) resp.longStreak = result.longStreak;
     if (result.antiStreak) resp.antiStreak = result.antiStreak;
     res.json(resp);
   } catch (e) {
@@ -1553,7 +1766,7 @@ app.get('/api/jsonp/:game/:table', async (req, res) => {
     }
     if (!data?.length) return res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' })});`);
     const key = `${game}_${table}`;
-    const result = calculatePrediction(data, key, key, 'aggressive');
+    const result = calculatePrediction(data, table, key, 'aggressive');
     res.type('js').send(`${cb}(${JSON.stringify(buildCompactResponse(data, result))});`);
   } catch (_) {
     res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' })});`);
@@ -1596,8 +1809,11 @@ app.use((req, res) => res.status(404).json({ error: 'NOT_FOUND', path: req.path,
 // ═══════════════════════════════════════════════════════════
 function startServer() {
   log('══════════════════════════════════════════════');
-  log('🚀 TAIXIU-AI v11 — KHÔNG SKIP + ANTI-STREAK LOCK');
+  log('🚀 TAIXIU-AI v12 — BOOK MARKOV + ANTI-STREAK');
   log('══════════════════════════════════════════════');
+  log(`📁 Data dir: ${DATA_DIR}`);
+  log(`📚 LC79 MD5 book: ${LC79_MD5_BOOK?.book ? Object.keys(LC79_MD5_BOOK.book).length : 0} patterns`);
+  log(`📚 LC79 HU book:  ${LC79_HU_BOOK?.book  ? Object.keys(LC79_HU_BOOK.book).length  : 0} patterns`);
 
   const ips = [];
   for (const nets of Object.values(os.networkInterfaces())) {
@@ -1613,9 +1829,12 @@ function startServer() {
     log('');
     log('📱 UI: / hoặc /tool');
     log('🔌 API:');
-    log('   GET  /api/predict/:game/:table  (LUÔN trả dự đoán, không skip)');
-    log('   GET  /api/jsonp/:game/:table?callback=fn');
+    log('   GET  /api/predict/:game/:table  (LUÔN trả dự đoán)');
     log('   GET  /predict/:type (hu|md5)');
+    log('   GET  /api/jsonp/:game/:table?callback=fn');
+    log('   GET  /api/book/:table            [MỚI] Xem book');
+    log('   POST /api/book/reload            [MỚI] Reload book từ file');
+    log('   POST /api/book/upload/:table     [MỚI] Upload book mới');
     log('   GET  /api/games | /api/info | /health');
     log('   GET  /api/pattern10');
     log('   GET  /api/history/dudoan[?limit=N&game=G]');
