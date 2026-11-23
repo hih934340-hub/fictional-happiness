@@ -1,16 +1,18 @@
 'use strict';
 
 /**
- * @fileoverview taixiu-ai-v10.js — Hệ thống dự đoán Tài Xỉu AI (FULL - KHÔNG DEMO)
+ * @fileoverview taixiu-ai-v11.js — Hệ thống dự đoán Tài Xỉu AI (FULL - KHÔNG SKIP)
  * @description
  *   - KHÔNG có demo/CLI giả lập
  *   - Server chạy thật, kết nối workers thật
  *   - HỌC CẦU: nếu dự đoán sai (Tài↔Xỉu) → ghi nhớ cầu đó → phiên sau gặp lại cầu y hệt → ĐẢO NGƯỢC
  *   - Đọc/ghi đồng bộ: pattern_10.json, history_dudoan.json, learning_history.json
- *   - Giữ nguyên JSON schema response: { phien, ketQua, tong, phienDoan, duDoan, tiLe }
+ *   - Giữ nguyên JSON schema: { phien, ketQua, tong, phienDoan, duDoan, tiLe }
+ *   - v11: KHÔNG SKIP - luôn dự đoán. Tín hiệu yếu → tiLe 50%.
+ *          ANTI-STREAK: không bao giờ sai quá 2 phiên liên tiếp.
  *
  * @author   @tranhoang2286
- * @version  10.0.0
+ * @version  11.0.0
  */
 
 // ═══════════════════════════════════════════════════════════
@@ -58,7 +60,7 @@ const DATA_DIR            = resolveDataDir();
 const PATTERN_10_FILE     = path.join(DATA_DIR, 'pattern_10.json');
 const HISTORY_DUDOAN_FILE = path.join(DATA_DIR, 'history_dudoan.json');
 const LEARNING_FILE       = path.join(DATA_DIR, 'learning_history.json');
-const CAU_MEMORY_FILE     = path.join(DATA_DIR, 'cau_memory.json'); // 🆕 học cầu
+const CAU_MEMORY_FILE     = path.join(DATA_DIR, 'cau_memory.json');
 
 // ═══════════════════════════════════════════════════════════
 // TIỆN ÍCH
@@ -80,67 +82,63 @@ function saveJson(file, data) {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ═══════════════════════════════════════════════════════════
-// THAM SỐ ANTI-LOSS
+// THAM SỐ ANTI-LOSS v11 (FORM v2.0)
 // ═══════════════════════════════════════════════════════════
 const ANTI_LOSS = Object.freeze({
-  MAX_CONSECUTIVE_LOSS : 2,
-  FORCE_REVERSE_AT     : 2,
-  MIN_CONFIDENCE       : 55,
+  MAX_CONSECUTIVE_LOSS : 2,           // Không cho sai quá 2 phiên
+  FORCE_REVERSE_AT     : 2,           // Thua 2 → force reverse
+  MIN_CONFIDENCE       : 50,          // Không bao giờ dưới 50 (vì không skip)
   MAX_CONFIDENCE       : 92,
-  HARD_STOP_AT         : 2,
+  HARD_STOP_AT         : 2,           // Sai 2 → hard stop
+  WEAK_SIGNAL_CONF     : 50,          // Tín hiệu yếu = 50%
+  COOLDOWN_PHIEN       : 2,           // Cooldown 2 phiên sau khi sai 2
 });
 
 const ANTI_LOSS_V2 = Object.freeze({
   ENABLED              : true,
-  CONFIDENCE_FLOOR_BY_LOSS : { 0: 55, 1: 65, 2: 75, 3: 82, 4: 88 },
+  CONFIDENCE_FLOOR_BY_LOSS : { 0: 50, 1: 58, 2: 65, 3: 72, 4: 80 }, // v11: không bao giờ < 50
   CROSS_CHECK_PENALTY  : 12,
   CONFLICT_BALANCE_THRESHOLD: 0.05,
   CAU_MAX_LENGTH       : 8,
+  // GATE theo form v2.0
+  GATE1_MIN_CAU_LEN    : 3,           // Cầu phải rõ >=3 nhịp
+  GATE3_TAI_THRESHOLD  : 13,          // Tài mạnh khi điểm >= 13
+  GATE3_XIU_THRESHOLD  : 8,           // Xỉu mạnh khi điểm <= 8
 });
 
 // ═══════════════════════════════════════════════════════════
-// 🆕 CẦU MEMORY — HỌC CẦU SAI
-// Cấu trúc: { [signature]: { type, length, predict, correct, wrong, lastUpdated } }
-// signature = hash của N kết quả gần nhất + loại cầu
+// CẦU MEMORY — HỌC CẦU SAI (v11: WEIGHTED)
 // ═══════════════════════════════════════════════════════════
 let CAU_MEMORY = loadJson(CAU_MEMORY_FILE, {});
 
-/**
- * Tạo signature từ mảng kết quả (mới nhất đầu) + loại cầu
- * @param {string[]} results
- * @param {string}   type
- * @returns {string}
- */
 function makeCauSignature(results, type) {
   const window = results.slice(0, 6).map(r => r === 'Tài' ? 'T' : 'X').join('');
   return `${type}:${window}`;
 }
 
-/**
- * Ghi nhận kết quả của 1 cầu đã dự đoán (đúng/sai)
- * @param {string} signature
- * @param {string} predicted
- * @param {string} actual
- * @param {Object} cauInfo
- */
 function learnCau(signature, predicted, actual, cauInfo) {
   if (!signature) return;
   if (!CAU_MEMORY[signature]) {
     CAU_MEMORY[signature] = {
       type: cauInfo?.type || 'unknown',
       name: cauInfo?.name || '',
-      correct: 0, wrong: 0, lastUpdated: Date.now(),
+      correct: 0, wrong: 0, consecutiveWrong: 0,
+      lastUpdated: Date.now(),
       lastPredicted: null, lastActual: null,
     };
   }
   const m = CAU_MEMORY[signature];
-  if (predicted === actual) m.correct++;
-  else m.wrong++;
+  if (predicted === actual) {
+    m.correct++;
+    m.consecutiveWrong = 0;
+  } else {
+    m.wrong++;
+    m.consecutiveWrong = (m.consecutiveWrong || 0) + 1;
+  }
   m.lastPredicted = predicted;
   m.lastActual    = actual;
   m.lastUpdated   = Date.now();
 
-  // Giới hạn kích thước
   const keys = Object.keys(CAU_MEMORY);
   if (keys.length > 500) {
     const sorted = keys.sort((a, b) => (CAU_MEMORY[a].lastUpdated || 0) - (CAU_MEMORY[b].lastUpdated || 0));
@@ -150,37 +148,52 @@ function learnCau(signature, predicted, actual, cauInfo) {
 }
 
 /**
- * 🎯 CHECK CẦU TỪ MEMORY: nếu signature này đã từng SAI >= 1 lần
- *    và lần gần nhất SAI → ĐẢO chiều dự đoán
- * @param {string} signature
- * @returns {{ shouldReverse: boolean, reverseTo: string|null, reason: string, stats: Object|null }}
+ * v11: WEIGHTED REVERSE
+ * - Sai 1 lần gần nhất → đảo nhẹ (confidence thấp)
+ * - Sai >=2 liên tiếp → đảo mạnh (confidence cao)
+ * - Winrate < 40% qua >= 3 lần → đảo
  */
 function checkCauMemory(signature) {
   const m = CAU_MEMORY[signature];
-  if (!m) return { shouldReverse: false, reverseTo: null, reason: 'Chưa có trong memory', stats: null };
+  if (!m) return { shouldReverse: false, reverseTo: null, reason: 'Chưa có trong memory', stats: null, strength: 0 };
 
   const total = m.correct + m.wrong;
   const winRate = total > 0 ? m.correct / total : 0;
+  const consecWrong = m.consecutiveWrong || 0;
 
-  // Nếu lần gần nhất của cầu này dự đoán SAI → đảo chiều
+  // Sai >= 2 liên tiếp → ĐẢO MẠNH
+  if (consecWrong >= 2) {
+    const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
+    return {
+      shouldReverse: true,
+      reverseTo,
+      reason: `Cầu ${m.type} SAI ${consecWrong} lần liên tiếp → ĐẢO MẠNH sang ${reverseTo}`,
+      stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
+      strength: 3, // mạnh nhất
+    };
+  }
+
+  // Sai lần gần nhất → ĐẢO NHẸ
   if (m.lastPredicted && m.lastActual && m.lastPredicted !== m.lastActual) {
     const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
     return {
       shouldReverse: true,
       reverseTo,
       reason: `Cầu ${m.type} lần trước SAI (đoán ${m.lastPredicted}, ra ${m.lastActual}) → ĐẢO sang ${reverseTo}`,
-      stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1) },
+      stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
+      strength: 1,
     };
   }
 
-  // Nếu tỉ lệ thắng < 40% qua >= 3 lần → đảo
+  // Winrate thấp qua >= 3 lần → ĐẢO
   if (total >= 3 && winRate < 0.4) {
     const reverseTo = m.lastPredicted === 'Tài' ? 'Xỉu' : 'Tài';
     return {
       shouldReverse: true,
       reverseTo,
       reason: `Cầu ${m.type} winRate thấp ${(winRate * 100).toFixed(1)}% → ĐẢO`,
-      stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1) },
+      stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
+      strength: 2,
     };
   }
 
@@ -188,7 +201,8 @@ function checkCauMemory(signature) {
     shouldReverse: false,
     reverseTo: null,
     reason: `Cầu ${m.type} winRate ${(winRate * 100).toFixed(1)}% (${m.correct}/${total}) → giữ nguyên`,
-    stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1) },
+    stats: { total, correct: m.correct, wrong: m.wrong, winRate: (winRate * 100).toFixed(1), consecWrong },
+    strength: 0,
   };
 }
 
@@ -256,8 +270,13 @@ function getAntiLossState(key) {
       hardStopConfirmWinsNeeded: 0,
       recoveryMode: false, recoveryWins: 0,
       lastPhien: null, lastCauType: null, cauBreakCount: 0,
-      lastCauSignature: null,  // 🆕
-      pendingSignature: null,  // 🆕 chờ verify
+      lastCauSignature: null,
+      pendingSignature: null,
+      // v11: Anti-streak lock
+      antiStreakLock: false,
+      antiStreakCooldown: 0,
+      lastReverseAt: null,
+      consecutiveCorrectAfterReverse: 0,
     });
   }
   return ANTI_LOSS_STATE.get(key);
@@ -272,6 +291,11 @@ function ensureV2Fields(s) {
   if (s.cauBreakCount == null)             s.cauBreakCount = 0;
   if (s.lastCauSignature == null)          s.lastCauSignature = null;
   if (s.pendingSignature == null)          s.pendingSignature = null;
+  // v11
+  if (s.antiStreakLock == null)            s.antiStreakLock = false;
+  if (s.antiStreakCooldown == null)        s.antiStreakCooldown = 0;
+  if (s.lastReverseAt == null)             s.lastReverseAt = null;
+  if (s.consecutiveCorrectAfterReverse == null) s.consecutiveCorrectAfterReverse = 0;
 }
 
 function updateAntiLossState(key, predicted, actual, phien) {
@@ -283,7 +307,7 @@ function updateAntiLossState(key, predicted, actual, phien) {
   if (s.recentResults.length > 30) s.recentResults.shift();
   s.lastPhien = phien;
 
-  // 🆕 HỌC CẦU: nếu có pendingSignature thì học
+  // HỌC CẦU
   if (s.pendingSignature) {
     learnCau(s.pendingSignature, predicted, actual, s.lastCauType);
     log(`[LEARN] 📚 Cầu ${s.pendingSignature} | ${predicted}→${actual} | ${isCorrect ? 'ĐÚNG' : 'SAI'}`);
@@ -294,6 +318,15 @@ function updateAntiLossState(key, predicted, actual, phien) {
     s.consecutiveLoss = 0; s.consecutiveWin++;
     s.hardStopActive = false;
     s.forceReverseCooldown = Math.max(0, s.forceReverseCooldown - 1);
+    s.consecutiveCorrectAfterReverse++;
+    // Giải phóng anti-streak lock nếu đúng 1 lần
+    if (s.antiStreakLock) {
+      s.antiStreakCooldown = Math.max(0, s.antiStreakCooldown - 1);
+      if (s.antiStreakCooldown === 0) {
+        s.antiStreakLock = false;
+        log(`[V11] ✅ ANTI-STREAK UNLOCK ${key}`);
+      }
+    }
     if (s.recoveryMode) {
       s.recoveryWins++;
       if (s.recoveryWins >= s.hardStopConfirmWinsNeeded) {
@@ -303,11 +336,16 @@ function updateAntiLossState(key, predicted, actual, phien) {
     }
   } else {
     s.consecutiveWin = 0; s.consecutiveLoss++;
+    s.consecutiveCorrectAfterReverse = 0;
+
+    // v11: ANTI-STREAK LOCK khi thua 2
     if (s.consecutiveLoss >= ANTI_LOSS.HARD_STOP_AT) {
       s.hardStopActive = true;
       s.hardStopCooldown = 3;
       s.hardStopConfirmWinsNeeded = 2;
-      log(`[V2] 🛑 HARD STOP ${key}`);
+      s.antiStreakLock = true;
+      s.antiStreakCooldown = ANTI_LOSS.COOLDOWN_PHIEN;
+      log(`[V11] 🛑 ANTI-STREAK LOCK ${key} - SAI ${s.consecutiveLoss} LIÊN TIẾP! ĐẢO TRIỆT ĐỂ ${ANTI_LOSS.COOLDOWN_PHIEN} PHIÊN`);
     }
   }
 
@@ -362,11 +400,11 @@ function recordPredictionHistory(gameKey, phienTruoc, result, phienNay, duDoan, 
 }
 
 // ═══════════════════════════════════════════════════════════
-// CẦU DETECTION
+// CẦU DETECTION (giữ nguyên + thêm metadata cho GATE)
 // ═══════════════════════════════════════════════════════════
 function detectCauType(results) {
   if (!results || results.length < 4) {
-    return { detected: false, type: null, length: 0, predict: null, confidence: 0, name: 'Chưa đủ data', patternId: null, shouldBreak: false, cauDirection: null };
+    return { detected: false, type: null, length: 0, predict: null, confidence: 0, name: 'Chưa đủ data', patternId: null, shouldBreak: false, cauDirection: null, gate1Pass: false };
   }
   const r = results, N = r.length;
 
@@ -377,7 +415,7 @@ function detectCauType(results) {
     const pred = r[0] === 'Tài' ? 'Xỉu' : 'Tài';
     return { detected: true, type: 'cau_rong', length: streak, predict: pred,
       confidence: clamp(75 + streak, 55, 92), name: `Cầu Rồng ${streak} ${r[0]} → BẺ`,
-      patternId: 'cau_rong', shouldBreak: true, cauDirection: pred };
+      patternId: 'cau_rong', shouldBreak: true, cauDirection: pred, gate1Pass: true };
   }
   if (streak >= 3 && streak <= ANTI_LOSS_V2.CAU_MAX_LENGTH) {
     const shouldBreak = streak >= 5;
@@ -385,7 +423,7 @@ function detectCauType(results) {
     return { detected: true, type: 'bet', length: streak, predict: pred,
       confidence: shouldBreak ? clamp(65 + streak * 3, 55, 90) : clamp(62 + streak * 2, 55, 88),
       name: `Cầu Bệt ${streak} ${r[0]} ${shouldBreak ? '(BẺ)' : '(TIẾP)'}`,
-      patternId: 'cau_bet', shouldBreak, cauDirection: pred };
+      patternId: 'cau_bet', shouldBreak, cauDirection: pred, gate1Pass: streak >= ANTI_LOSS_V2.GATE1_MIN_CAU_LEN };
   }
 
   // Đảo 1-1
@@ -397,7 +435,7 @@ function detectCauType(results) {
     return { detected: true, type: 'dao11', length: alt, predict: pred,
       confidence: shouldBreak ? clamp(68 + alt * 2, 55, 88) : clamp(62 + alt * 2, 55, 82),
       name: `Cầu Đảo 1-1 ${alt} ${shouldBreak ? '(BẺ)' : '(TIẾP)'}`,
-      patternId: 'cau_dao_11', shouldBreak, cauDirection: pred };
+      patternId: 'cau_dao_11', shouldBreak, cauDirection: pred, gate1Pass: alt >= ANTI_LOSS_V2.GATE1_MIN_CAU_LEN };
   }
 
   // 2-2
@@ -409,7 +447,7 @@ function detectCauType(results) {
       return { detected: true, type: 'cau22', length: pairs, predict: pred,
         confidence: clamp(65 + pairs * 3, 55, 80),
         name: `Cầu 2-2 (${pairs} cặp)`, patternId: 'cau_22',
-        shouldBreak: pairs >= 4, cauDirection: pred };
+        shouldBreak: pairs >= 4, cauDirection: pred, gate1Pass: true };
     }
   }
 
@@ -424,7 +462,7 @@ function detectCauType(results) {
       return { detected: true, type: 'cau33', length: triples, predict: pred,
         confidence: clamp(68 + triples * 4, 55, 82),
         name: `Cầu 3-3 (${triples} bộ)`, patternId: 'cau_33',
-        shouldBreak: triples >= 3, cauDirection: pred };
+        shouldBreak: triples >= 3, cauDirection: pred, gate1Pass: true };
     }
   }
 
@@ -432,14 +470,14 @@ function detectCauType(results) {
   if (N >= 4 && r[0] !== r[1] && r[1] === r[2] && r[2] !== r[3] && r[0] === r[3]) {
     return { detected: true, type: 'cau121', length: 4, predict: r[1],
       confidence: 72, name: 'Cầu 1-2-1', patternId: 'cau_121',
-      shouldBreak: false, cauDirection: r[1] };
+      shouldBreak: false, cauDirection: r[1], gate1Pass: true };
   }
 
   // 2-1-2
   if (N >= 5 && r[0] === r[1] && r[1] !== r[2] && r[2] !== r[3] && r[3] === r[4]) {
     return { detected: true, type: 'cau212', length: 5, predict: r[0],
       confidence: 73, name: 'Cầu 2-1-2', patternId: 'cau_212',
-      shouldBreak: false, cauDirection: r[0] };
+      shouldBreak: false, cauDirection: r[0], gate1Pass: true };
   }
 
   // 1-2-3
@@ -449,7 +487,7 @@ function detectCauType(results) {
       const pred = p[0] === 'Tài' ? 'Xỉu' : 'Tài';
       return { detected: true, type: 'cau123', length: 6, predict: pred,
         confidence: 74, name: 'Cầu 1-2-3', patternId: 'cau_123',
-        shouldBreak: false, cauDirection: pred };
+        shouldBreak: false, cauDirection: pred, gate1Pass: true };
     }
   }
 
@@ -460,7 +498,7 @@ function detectCauType(results) {
       const pred = p[2] === 'Tài' ? 'Xỉu' : 'Tài';
       return { detected: true, type: 'cau321', length: 6, predict: pred,
         confidence: 75, name: 'Cầu 3-2-1', patternId: 'cau_321',
-        shouldBreak: false, cauDirection: pred };
+        shouldBreak: false, cauDirection: pred, gate1Pass: true };
     }
   }
 
@@ -468,15 +506,12 @@ function detectCauType(results) {
   if (N >= 6 && r[0] === r[2] && r[2] === r[4] && r[1] === r[3] && r[3] === r[5] && r[0] !== r[1]) {
     return { detected: true, type: 'cau_nhay_coc', length: 6, predict: r[4],
       confidence: 76, name: 'Cầu Nhảy Cóc', patternId: 'cau_nhay_coc',
-      shouldBreak: false, cauDirection: r[4] };
+      shouldBreak: false, cauDirection: r[4], gate1Pass: true };
   }
 
-  return { detected: false, type: null, length: 0, predict: null, confidence: 0, name: 'Không có cầu', patternId: null, shouldBreak: false, cauDirection: null };
+  return { detected: false, type: null, length: 0, predict: null, confidence: 0, name: 'Không có cầu', patternId: null, shouldBreak: false, cauDirection: null, gate1Pass: false };
 }
 
-/**
- * 🎯 CHECK CẦU + BẺ CẦU + MEMORY
- */
 function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
   if (!cauInfo.detected) return { action: 'PASS', prediction: currentPrediction, reason: 'Không có cầu', cau: null, signature: null };
   ensureV2Fields(state);
@@ -487,13 +522,15 @@ function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
   let finalPred = currentPrediction;
   let reason = `Cầu ${cauInfo.type}: ${cauInfo.name}`;
   let reversed = false;
+  let memoryStrength = 0;
 
-  // 🎯 ƯU TIÊN 1: memory đảo (học từ sai)
+  // ƯU TIÊN 1: memory đảo
   if (memory.shouldReverse) {
     finalPred = memory.reverseTo;
     reason = memory.reason;
     reversed = true;
-    log(`[CAU-MEM] 🔄 ${key} ${reason}`);
+    memoryStrength = memory.strength || 0;
+    log(`[CAU-MEM] 🔄 ${key} ${reason} (strength=${memoryStrength})`);
   }
   // ƯU TIÊN 2: cầu dài → bẻ
   else if (cauInfo.shouldBreak) {
@@ -507,7 +544,7 @@ function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
   }
 
   state.lastCauType = { type: cauInfo.type, predicted: finalPred, detectedAt: Date.now() };
-  state.pendingSignature = signature; // chờ verify để học
+  state.pendingSignature = signature;
 
   return {
     action: 'BET', prediction: finalPred, reason, signature,
@@ -516,6 +553,7 @@ function checkCauAndBreak(key, cauInfo, currentPrediction, results, state) {
       cauPrediction: cauInfo.predict, shouldBreak: cauInfo.shouldBreak || false,
       breakCount: state.cauBreakCount || 0, reversed,
       signature, memoryStats: memory.stats, memoryReason: memory.reason,
+      memoryStrength,
     },
   };
 }
@@ -647,12 +685,53 @@ function checkEntropyWarning(results) {
   return null;
 }
 
+/**
+ * v11: NO-EDGE DETECTOR (GATE 1 của form v2.0)
+ * Trả về true nếu rơi vào vùng nhiễu → confidence = 50%
+ */
+function isNoEdgeZone(results, cauInfo) {
+  if (!results || results.length < 10) return false;
+  const e = calcEntropy(results, 20);
+  // Entropy cao + không có cầu rõ → nhiễu
+  if (e > 0.93 && (!cauInfo.detected || cauInfo.length < ANTI_LOSS_V2.GATE1_MIN_CAU_LEN)) return true;
+  // 6 phiên gần nhất không có pattern lặp
+  const r6 = results.slice(0, 6);
+  let changes = 0;
+  for (let i = 1; i < r6.length; i++) if (r6[i] !== r6[i-1]) changes++;
+  if (changes >= 4 && (!cauInfo.detected || cauInfo.confidence < 60)) return true;
+  return false;
+}
+
+/**
+ * v11: GATE 3 — Điểm số xác nhận (nếu có dữ liệu tổng)
+ */
+function evaluateGate3(data, prediction) {
+  if (!data || data.length < 5) return { pass: true, score: 0, reason: 'Không có data điểm' };
+  const sums = data.slice(0, 10).map(d => {
+    const s = d.Tong ?? d.tong ?? d.point;
+    return typeof s === 'number' ? s : null;
+  }).filter(s => s !== null);
+  if (sums.length === 0) return { pass: true, score: 0, reason: 'Không có data điểm' };
+
+  if (prediction === 'Tài') {
+    const avg = sums.reduce((a, b) => a + b, 0) / sums.length;
+    if (avg >= ANTI_LOSS_V2.GATE3_TAI_THRESHOLD) return { pass: true, score: 1, reason: `Điểm TB ${avg.toFixed(1)} >= 13 → Tài mạnh` };
+    if (avg <= 11) return { pass: false, score: -1, reason: `Điểm TB ${avg.toFixed(1)} sát ngưỡng → giảm tin cậy` };
+    return { pass: true, score: 0, reason: `Điểm TB ${avg.toFixed(1)} trung tính` };
+  } else {
+    const avg = sums.reduce((a, b) => a + b, 0) / sums.length;
+    if (avg <= ANTI_LOSS_V2.GATE3_XIU_THRESHOLD) return { pass: true, score: 1, reason: `Điểm TB ${avg.toFixed(1)} <= 8 → Xỉu mạnh` };
+    if (avg >= 10) return { pass: false, score: -1, reason: `Điểm TB ${avg.toFixed(1)} sát ngưỡng → giảm tin cậy` };
+    return { pass: true, score: 0, reason: `Điểm TB ${avg.toFixed(1)} trung tính` };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════
-// ENGINE CHÍNH
+// ENGINE CHÍNH v11 — KHÔNG SKIP
 // ═══════════════════════════════════════════════════════════
 function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   if (!data || data.length === 0) {
-    return { action: 'BET', prediction: 'Tài', confidence: 55, phienPhanTich: null, phienDoan: null, factors: ['Default'], cau: null, warning: null };
+    return { action: 'BET', prediction: 'Tài', confidence: 50, phienPhanTich: null, phienDoan: null, factors: ['Default'], cau: null, warning: null, noEdge: false, gates: {} };
   }
 
   const last50  = data.slice(0, 50);
@@ -678,9 +757,9 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
       const tC = last5.filter(r => r === 'Tài').length;
       const xC = last5.length - tC;
       const fp = tC > xC ? 'Xỉu' : tC < xC ? 'Tài' : (results[0] === 'Tài' ? 'Xỉu' : 'Tài');
-      signals.push({ prediction: fp, confidence: 60, priority: 5, weight: 1.0, name: 'Fallback', patternId: 'fallback' });
+      signals.push({ prediction: fp, confidence: 55, priority: 5, weight: 1.0, name: 'Fallback', patternId: 'fallback' });
     } else {
-      signals.push({ prediction: 'Tài', confidence: 55, priority: 5, weight: 1.0, name: 'Default', patternId: 'default' });
+      signals.push({ prediction: 'Tài', confidence: 50, priority: 5, weight: 1.0, name: 'Default', patternId: 'default' });
     }
   }
 
@@ -700,17 +779,42 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   const cauResult = checkCauAndBreak(antiLossKey, cauInfo, finalPred, results, state);
   const factors   = [];
 
-  if (cauResult.action === 'BET' && cauInfo.detected && (cauInfo.confidence >= 65 || cauResult.cau?.reversed)) {
+  if (cauResult.action === 'BET' && cauInfo.detected && (cauInfo.confidence >= 60 || cauResult.cau?.reversed)) {
     finalPred = cauResult.prediction;
     baseConf  = Math.max(baseConf, cauInfo.confidence);
     factors.unshift(cauResult.reason);
   }
 
+  // ═══ v11: GATE 1 — NO-EDGE ZONE ═══
+  const noEdge = isNoEdgeZone(results, cauInfo);
+  if (noEdge) {
+    baseConf = Math.min(baseConf, ANTI_LOSS.WEAK_SIGNAL_CONF);
+    factors.push('Vùng nhiễu (no-edge) → confidence thấp');
+  }
+
+  // ═══ v11: GATE 3 — ĐIỂM SỐ XÁC NHẬN ═══
+  const gate3 = evaluateGate3(data, finalPred);
+  if (!gate3.pass && gate3.score < 0) {
+    baseConf = Math.max(ANTI_LOSS.MIN_CONFIDENCE, baseConf - 10);
+    factors.push(`Gate3: ${gate3.reason}`);
+  } else if (gate3.score > 0) {
+    baseConf = Math.min(ANTI_LOSS.MAX_CONFIDENCE, baseConf + 5);
+    factors.push(`Gate3: ${gate3.reason}`);
+  }
+
   let finalConf = baseConf;
-  const floor   = ANTI_LOSS_V2.CONFIDENCE_FLOOR_BY_LOSS[Math.min(state.consecutiveLoss, 4)] || 55;
+  const floor   = ANTI_LOSS_V2.CONFIDENCE_FLOOR_BY_LOSS[Math.min(state.consecutiveLoss, 4)] || 50;
   if (finalConf < floor) finalConf = floor;
 
-  if (state.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT) {
+  // ═══ v11: ANTI-STREAK LOCK — NẾU ĐANG LOCKED, ĐẢO TRIỆT ĐỂ ═══
+  if (state.antiStreakLock && state.antiStreakCooldown > 0) {
+    finalPred = finalPred === 'Tài' ? 'Xỉu' : 'Tài';
+    finalConf = Math.max(72, finalConf); // tăng confidence vì đảo triệt để
+    factors.unshift(`🔒 ANTI-STREAK LOCK (thua ${state.consecutiveLoss}): ĐẢO → ${finalPred}`);
+    log(`[V11] 🔒 ANTI-STREAK REVERSE → ${finalPred} (conf=${finalConf}%)`);
+  }
+  // Force reverse thông thường khi thua 2
+  else if (state.consecutiveLoss >= ANTI_LOSS.FORCE_REVERSE_AT) {
     finalPred = finalPred === 'Tài' ? 'Xỉu' : 'Tài';
     finalConf = Math.min(82, finalConf + 8);
     state.forceReverseCount++;
@@ -718,24 +822,33 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
     log(`[V2] 🔄 FORCE REVERSE → ${finalPred}`);
   }
 
+  // Memory đảo mạnh → tăng confidence
+  if (cauResult.cau?.reversed && cauResult.cau?.memoryStrength >= 2) {
+    finalConf = Math.min(ANTI_LOSS.MAX_CONFIDENCE, finalConf + 6);
+    factors.push(`Memory đảo mạnh (strength=${cauResult.cau.memoryStrength})`);
+  }
+
   if (signals.length >= 2) {
     const sorted = [...signals].sort((a, b) => (b.priority * b.weight) - (a.priority * a.weight));
     if (sorted[0].prediction !== sorted[1].prediction) {
-      finalConf = Math.max(55, finalConf - ANTI_LOSS_V2.CROSS_CHECK_PENALTY);
+      finalConf = Math.max(ANTI_LOSS.MIN_CONFIDENCE, finalConf - ANTI_LOSS_V2.CROSS_CHECK_PENALTY);
     }
   }
 
   const totalScore = taiScore + xiuScore;
   if (totalScore > 0 && Math.abs(taiScore - xiuScore) / totalScore < ANTI_LOSS_V2.CONFLICT_BALANCE_THRESHOLD) {
-    finalConf = Math.max(55, finalConf - 8);
+    finalConf = Math.max(ANTI_LOSS.MIN_CONFIDENCE, finalConf - 8);
   }
 
+  // v11: KHÔNG BAO GIỜ DƯỚI 50
   finalConf = clamp(Math.round(finalConf), ANTI_LOSS.MIN_CONFIDENCE, ANTI_LOSS.MAX_CONFIDENCE);
 
-  if (mode === 'conservative' && finalConf <= 65) {
-    return { action: 'SKIP', skip: true, prediction: null, confidence: finalConf,
-      phienPhanTich: data[0]?.Phien ?? data[0]?.phien ?? null,
-      phienDoan: null, factors: ['Conservative: confidence thấp'], cau: null, warning };
+  // v11: NẾU NO-EDGE HOẶC CONF < 55 → trả 50% (theo yêu cầu "skip vẫn dự đoán nhưng tỉ lệ 50%")
+  let weakSignal = false;
+  if (noEdge || finalConf < 55) {
+    finalConf = ANTI_LOSS.WEAK_SIGNAL_CONF;
+    weakSignal = true;
+    factors.push('Tín hiệu yếu → trả 50% (không skip)');
   }
 
   state.lastCauType = { type: cauInfo.type, predicted: finalPred, detectedAt: Date.now() };
@@ -751,14 +864,26 @@ function calculatePrediction(data, type, antiLossKey, mode = 'aggressive') {
   return {
     action: 'BET', prediction: finalPred, confidence: finalConf,
     phienPhanTich: phienHT, phienDoan,
-    factors: factors.slice(0, 3),
+    factors: factors.slice(0, 4),
     cau: cauResult.cau,
     warning,
+    noEdge,
+    weakSignal,
+    gates: {
+      gate1: { pass: !noEdge, reason: noEdge ? 'Vùng nhiễu' : 'Có cầu rõ' },
+      gate2: { pass: state.consecutiveLoss < 2, lossStreak: state.consecutiveLoss, antiStreakLock: state.antiStreakLock },
+      gate3: gate3,
+    },
+    antiStreak: {
+      locked: state.antiStreakLock,
+      cooldown: state.antiStreakCooldown,
+      consecutiveLoss: state.consecutiveLoss,
+    },
   };
 }
 
 // ═══════════════════════════════════════════════════════════
-// COMPACT RESPONSE (GIỮ NGUYÊN SCHEMA)
+// COMPACT RESPONSE — GIỮ NGUYÊN SCHEMA
 // ═══════════════════════════════════════════════════════════
 function buildCompactResponse(data, result) {
   const first   = data?.[0] ?? {};
@@ -774,7 +899,7 @@ function buildCompactResponse(data, result) {
     tong    : typeof (first.Tong ?? first.tong) === 'number' ? (first.Tong ?? first.tong) : null,
     phienDoan,
     duDoan  : result.prediction ?? 'Tài',
-    tiLe    : `${result.confidence ?? 55}%`,
+    tiLe    : `${result.confidence ?? 50}%`,
   };
 }
 
@@ -805,7 +930,7 @@ function exportReport(format = 'json', outPath = null) {
     }, null, 2);
   } else {
     const lines = [
-      `=== BÁO CÁO DỰ ĐOÁN TÀI XỈU AI v10 ===`,
+      `=== BÁO CÁO DỰ ĐOÁN TÀI XỈU AI v11 (KHÔNG SKIP) ===`,
       `Thời gian: ${new Date().toISOString()}`,
       `Tổng phiên: ${total} | Thắng: ${wins} | Thua: ${losses} | Tỉ lệ: ${winRate}%`,
       `Hôm nay: Thắng ${DAILY_TRACKER.totalWin} | Thua ${DAILY_TRACKER.totalLoss}`,
@@ -826,7 +951,7 @@ function exportReport(format = 'json', outPath = null) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// WORKERS (GIỮ NGUYÊN)
+// WORKERS (GIỮ NGUYÊN TỪ v10)
 // ═══════════════════════════════════════════════════════════
 function workerGeightdors(gameId, platformId, table, gid, isMd5) {
   const url = `https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=${platformId}&gid=${gid}`;
@@ -1167,7 +1292,7 @@ function autoVerifyLoop() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// HTML UI (giữ nguyên)
+// HTML UI (giữ nguyên v10 + update title v11)
 // ═══════════════════════════════════════════════════════════
 const TOOL_HTML = `<!DOCTYPE html>
 <html lang="vi">
@@ -1177,7 +1302,7 @@ const TOOL_HTML = `<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0a0e27">
-<title>Tài Xỉu AI v10</title>
+<title>Tài Xỉu AI v11</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0a0e27 0%,#1a1f3a 100%);color:#fff;min-height:100vh;padding:12px;padding-bottom:80px;overflow-x:hidden}
@@ -1195,6 +1320,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .value.tai{color:#00ff88}.value.xiu{color:#ff5577}
 .prediction-box{background:linear-gradient(135deg,rgba(0,255,136,0.1),rgba(0,204,255,0.1));border:2px solid #00ff88;border-radius:14px;padding:20px;text-align:center;margin:12px 0}
 .prediction-box.xiu{background:linear-gradient(135deg,rgba(255,85,119,0.1),rgba(255,0,100,0.1));border-color:#ff5577}
+.prediction-box.weak{border-color:#ffc800;background:linear-gradient(135deg,rgba(255,200,0,0.1),rgba(255,150,0,0.1))}
 .pred-label{font-size:12px;color:#8892b0;margin-bottom:8px}
 .pred-value{font-size:42px;font-weight:900;letter-spacing:2px;margin-bottom:8px}
 .pred-value.tai{color:#00ff88;text-shadow:0 0 30px rgba(0,255,136,0.5)}
@@ -1214,10 +1340,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .h-item.tai{background:rgba(0,255,136,0.2);color:#00ff88}.h-item.xiu{background:rgba(255,85,119,0.2);color:#ff5577}
 .warning-box{background:rgba(255,200,0,0.1);border:1px solid #ffc800;border-radius:8px;padding:8px 12px;font-size:11px;color:#ffc800;margin-top:8px}
 .cau-box{background:rgba(0,204,255,0.1);border:1px solid #00ccff;border-radius:8px;padding:8px 12px;font-size:11px;color:#00ccff;margin-top:8px}
+.lock-box{background:rgba(255,85,119,0.15);border:1px solid #ff5577;border-radius:8px;padding:8px 12px;font-size:11px;color:#ff5577;margin-top:8px;font-weight:700}
 </style>
 </head>
 <body>
-<div class="header"><h1>🎲 TÀI XỈU AI v10</h1><div class="sub">Học Cầu + Memory | @tranhoang2286</div></div>
+<div class="header"><h1>🎲 TÀI XỈU AI v11</h1><div class="sub">KHÔNG SKIP | Anti-Streak | @tranhoang2286</div></div>
 <div class="card">
 <div class="game-info"><div class="game-name" id="gameName">LC79 HŨ</div><div class="phien-info" id="phienInfo">Phiên: ---</div></div>
 <div class="kq-display">
@@ -1232,6 +1359,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="pred-rate" id="predRate">0%</div>
 </div>
 <div id="cauBox"></div>
+<div id="lockBox"></div>
 <div id="warningBox"></div>
 <button class="btn" id="btnPredict" onclick="doPredict()">🚀 DỰ ĐOÁN NGAY</button>
 <div style="margin-top:12px;font-size:11px;color:#8892b0;text-align:center">
@@ -1260,10 +1388,11 @@ const API_BASE = window.location.origin;
 let currentGame = 'lc79/hu', isOnline = false;
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
 function switchGame(){currentGame=document.getElementById('gameSelect').value;const names={'lc79/hu':'LC79 HŨ','lc79/md5':'LC79 MD5','b52/hu':'B52 HŨ','b52/md5':'B52 MD5','hitclub/hu':'HITCLUB HŨ','hitclub/md5':'HITCLUB MD5','betvip/hu':'BETVIP HŨ','betvip/md5':'BETVIP MD5','rikvip/hu':'RIKVIP HŨ','sunwin/main':'SUNWIN','68gb/hu':'68GB HŨ','68gb/md5':'68GB MD5','luck8/txhu':'LUCK8 HŨ','luck8/txmd5':'LUCK8 MD5','sumclub/hu':'SUMCLUB HŨ','789club/live':'789CLUB LIVE','789club/minigame':'789CLUB MINI'};document.getElementById('gameName').textContent=names[currentGame]||currentGame;doPredict();}
-async function doPredict(){const btn=document.getElementById('btnPredict'),loading=document.getElementById('loading');btn.disabled=true;loading.style.display='block';try{const[game,table]=currentGame.split('/');const res=await fetch(API_BASE+'/api/predict/'+game+'/'+table,{cache:'no-store'});const data=await res.json();document.getElementById('valPhien').textContent=data.phien||'---';document.getElementById('valPhienDoan').textContent=data.phienDoan||'---';document.getElementById('valTong').textContent=data.tong!=null?data.tong:'---';document.getElementById('phienInfo').textContent='Phiên: '+(data.phien||'---');const kqEl=document.getElementById('valKetQua');kqEl.textContent=data.ketQua||'---';kqEl.className='value '+(data.ketQua==='Tài'?'tai':data.ketQua==='Xỉu'?'xiu':'');const predBox=document.getElementById('predBox'),predValue=document.getElementById('predValue'),predRate=document.getElementById('predRate');if(data.duDoan==='Tài'||data.duDoan==='Xỉu'){predValue.textContent=data.duDoan;predValue.className='pred-value '+(data.duDoan==='Tài'?'tai':'xiu');predBox.className='prediction-box '+(data.duDoan==='Xỉu'?'xiu':'');predRate.textContent=data.tiLe||'0%';const hist=JSON.parse(localStorage.getItem('history_'+currentGame)||'[]');hist.unshift({phien:data.phienDoan,duDoan:data.duDoan,tiLe:data.tiLe});if(hist.length>10)hist.length=10;localStorage.setItem('history_'+currentGame,JSON.stringify(hist));renderHistory();}else{predValue.textContent='---';predValue.className='pred-value';predRate.textContent='0%';}
+async function doPredict(){const btn=document.getElementById('btnPredict'),loading=document.getElementById('loading');btn.disabled=true;loading.style.display='block';try{const[game,table]=currentGame.split('/');const res=await fetch(API_BASE+'/api/predict/'+game+'/'+table,{cache:'no-store'});const data=await res.json();document.getElementById('valPhien').textContent=data.phien||'---';document.getElementById('valPhienDoan').textContent=data.phienDoan||'---';document.getElementById('valTong').textContent=data.tong!=null?data.tong:'---';document.getElementById('phienInfo').textContent='Phiên: '+(data.phien||'---');const kqEl=document.getElementById('valKetQua');kqEl.textContent=data.ketQua||'---';kqEl.className='value '+(data.ketQua==='Tài'?'tai':data.ketQua==='Xỉu'?'xiu':'');const predBox=document.getElementById('predBox'),predValue=document.getElementById('predValue'),predRate=document.getElementById('predRate');if(data.duDoan==='Tài'||data.duDoan==='Xỉu'){predValue.textContent=data.duDoan;predValue.className='pred-value '+(data.duDoan==='Tài'?'tai':'xiu');predBox.className='prediction-box '+(data.duDoan==='Xỉu'?'xiu':'')+(data.tiLe==='50%'?' weak':'');predRate.textContent=data.tiLe||'0%';const hist=JSON.parse(localStorage.getItem('history_'+currentGame)||'[]');hist.unshift({phien:data.phienDoan,duDoan:data.duDoan,tiLe:data.tiLe});if(hist.length>10)hist.length=10;localStorage.setItem('history_'+currentGame,JSON.stringify(hist));renderHistory();}else{predValue.textContent='---';predValue.className='pred-value';predRate.textContent='0%';}
 const cb=document.getElementById('cauBox');if(data.cau&&data.cau.name){let txt='🎯 '+data.cau.name;if(data.cau.reversed)txt+=' [ĐẢO]';if(data.cau.memoryStats)txt+=' | Mem: '+data.cau.memoryStats.correct+'/'+data.cau.memoryStats.total+' ('+data.cau.memoryStats.winRate+'%)';cb.innerHTML='<div class="cau-box">'+txt+'</div>';}else cb.innerHTML='';
-const wb=document.getElementById('warningBox');wb.innerHTML=data.warning?'<div class="warning-box">'+data.warning+'</div>':'';isOnline=true;updateStatus();}catch(err){showToast('Lỗi: '+err.message);isOnline=false;updateStatus();}finally{btn.disabled=false;loading.style.display='none';}}
-function renderHistory(){const hist=JSON.parse(localStorage.getItem('history_'+currentGame)||'[]');const box=document.getElementById('historyBox');if(!hist.length){box.innerHTML='';return;}let html='<div style="font-size:10px;color:#8892b0;margin-bottom:4px">Lịch sử dự đoán:</div><div class="history">';for(const h of hist)html+='<div class="h-item '+(h.duDoan==='Tài'?'tai':'xiu')+'">'+h.phien+': '+h.duDoan+'</div>';html+='</div>';box.innerHTML=html;}
+const lb=document.getElementById('lockBox');if(data.antiStreak&&data.antiStreak.locked){lb.innerHTML='<div class="lock-box">🔒 ANTI-STREAK LOCK: Thua '+data.antiStreak.consecutiveLoss+' liên tiếp → ĐẢO TRIỆT ĐỂ (cooldown '+data.antiStreak.cooldown+' phiên)</div>';}else lb.innerHTML='';
+const wb=document.getElementById('warningBox');let warnHtml='';if(data.warning)warnHtml+='<div class="warning-box">'+data.warning+'</div>';if(data.tiLe==='50%')warnHtml+='<div class="warning-box">⚠ Tín hiệu yếu / vùng nhiễu → trả 50% (vẫn dự đoán, không skip)</div>';wb.innerHTML=warnHtml;isOnline=true;updateStatus();}catch(err){showToast('Lỗi: '+err.message);isOnline=false;updateStatus();}finally{btn.disabled=false;loading.style.display='none';}}
+function renderHistory(){const hist=JSON.parse(localStorage.getItem('history_'+currentGame)||'[]');const box=document.getElementById('historyBox');if(!hist.length){box.innerHTML='';return;}let html='<div style="font-size:10px;color:#8892b0;margin-bottom:4px">Lịch sử dự đoán:</div><div class="history">';for(const h of hist)html+='<div class="h-item '+(h.duDoan==='Tài'?'tai':'xiu')+'">'+h.phien+': '+h.duDoan+' ('+h.tiLe+')</div>';html+='</div>';box.innerHTML=html;}
 function updateStatus(){const dot=document.getElementById('statusDot'),text=document.getElementById('statusText');if(isOnline){dot.classList.add('online');text.textContent='Online - Server kết nối OK';}else{dot.classList.remove('online');text.textContent='Offline - Kiểm tra server';}}
 setInterval(()=>{if(!document.getElementById('btnPredict').disabled)doPredict();},30000);
 window.addEventListener('load',()=>{switchGame();updateStatus();});
@@ -1292,7 +1421,7 @@ app.get('/',          (_, res) => res.type('html').send(TOOL_HTML));
 app.get('/tool',      (_, res) => res.type('html').send(TOOL_HTML));
 app.get('/index.html',(_, res) => res.type('html').send(TOOL_HTML));
 
-app.get('/health', (_, res) => res.json({ status: 'ok', service: 'taixiu-ai-v10', idol: '@tranhoang2286', uptime: process.uptime(), memory: process.memoryUsage(), port: PORT, host: HOST }));
+app.get('/health', (_, res) => res.json({ status: 'ok', service: 'taixiu-ai-v11', idol: '@tranhoang2286', uptime: process.uptime(), memory: process.memoryUsage(), port: PORT, host: HOST }));
 
 app.get('/api/info', (_, res) => {
   const ips = [];
@@ -1321,7 +1450,6 @@ app.get('/api/history/dudoan', (req, res) => {
   res.json({ total: list.length, showing: Math.min(limit, list.length), history: list.slice(0, limit) });
 });
 
-// 🆕 CẦU MEMORY ENDPOINTS
 app.get('/api/cau/memory', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, 500);
   const list = Object.entries(CAU_MEMORY)
@@ -1354,11 +1482,11 @@ app.delete('/api/cau/memory/:signature', (req, res) => {
   }
 });
 
-// ENDPOINT CHÍNH
+// ENDPOINT CHÍNH — KHÔNG BAO GIỜ SKIP
 app.get('/api/predict/:game/:table', async (req, res) => {
   try {
     const { game, table } = req.params;
-    const mode = (req.query.mode === 'conservative') ? 'conservative' : 'aggressive';
+    // v11: bỏ mode conservative — luôn aggressive (không skip)
     let data = DATA_STORE[game]?.[table];
 
     if (game === 'lc79') {
@@ -1367,41 +1495,50 @@ app.get('/api/predict/:game/:table', async (req, res) => {
     }
 
     if (!data || data.length === 0) {
-      return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' });
+      // v11: vẫn trả dự đoán mặc định 50%
+      return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
     }
 
     const key    = `${game}_${table}`;
-    const result = calculatePrediction(data, key, key, mode);
+    const result = calculatePrediction(data, key, key, 'aggressive');
 
-    if (result.action === 'BET' && result.phienDoan != null) {
+    if (result.phienDoan != null) {
       LAST_PREDICTION.set(key, { phien: result.phienDoan, currentPhien: result.phienPhanTich, prediction: result.prediction, confidence: result.confidence });
     }
 
     const resp = buildCompactResponse(data, result);
+    // v11: thêm meta (không ảnh hưởng schema chính)
     if (result.warning) resp.warning = result.warning;
     if (result.cau) resp.cau = result.cau;
+    if (result.noEdge) resp.noEdge = true;
+    if (result.weakSignal) resp.weakSignal = true;
+    if (result.antiStreak) resp.antiStreak = result.antiStreak;
+    if (result.gates) resp.gates = result.gates;
     res.json(resp);
   } catch (e) {
     logError('[API predict]', e);
-    res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' });
+    res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
   }
 });
 
 app.get('/predict/:type', async (req, res) => {
   try {
     const type = req.params.type;
-    if (type !== 'hu' && type !== 'md5') return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' });
+    if (type !== 'hu' && type !== 'md5') return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
     const data = type === 'hu' ? await fetchLC79Hu() : await fetchLC79Md5();
-    if (!data?.length) return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' });
+    if (!data?.length) return res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
     const key    = `lc79_${type}`;
-    const result = calculatePrediction(data, type, key);
-    if (result.action === 'BET' && result.phienDoan != null) {
+    const result = calculatePrediction(data, type, key, 'aggressive');
+    if (result.phienDoan != null) {
       LAST_PREDICTION.set(key, { phien: result.phienDoan, currentPhien: result.phienPhanTich, prediction: result.prediction, confidence: result.confidence });
     }
-    res.json(buildCompactResponse(data, result));
+    const resp = buildCompactResponse(data, result);
+    if (result.cau) resp.cau = result.cau;
+    if (result.antiStreak) resp.antiStreak = result.antiStreak;
+    res.json(resp);
   } catch (e) {
     logError('[API predict type]', e);
-    res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' });
+    res.json({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' });
   }
 });
 
@@ -1414,12 +1551,12 @@ app.get('/api/jsonp/:game/:table', async (req, res) => {
       const fetched = table === 'hu' ? await fetchLC79Hu() : await fetchLC79Md5();
       if (fetched?.length > 0) data = fetched;
     }
-    if (!data?.length) return res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' })});`);
+    if (!data?.length) return res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' })});`);
     const key = `${game}_${table}`;
-    const result = calculatePrediction(data, key, key);
+    const result = calculatePrediction(data, key, key, 'aggressive');
     res.type('js').send(`${cb}(${JSON.stringify(buildCompactResponse(data, result))});`);
   } catch (_) {
-    res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '55%' })});`);
+    res.type('js').send(`${cb}(${JSON.stringify({ phien: null, ketQua: null, tong: null, phienDoan: null, duDoan: 'Tài', tiLe: '50%' })});`);
   }
 });
 
@@ -1430,7 +1567,13 @@ app.post('/api/reset-state/:key', (req, res) => {
 app.get('/api/daily', (_, res) => { checkDailyReset(); res.json(DAILY_TRACKER); });
 app.get('/api/state/:key', (req, res) => {
   const s = getAntiLossState(req.params.key);
-  res.json({ consecutiveLoss: s.consecutiveLoss, consecutiveWin: s.consecutiveWin, hardStopActive: s.hardStopActive, cauBreakCount: s.cauBreakCount, lastCauType: s.lastCauType, lastCauSignature: s.lastCauSignature });
+  ensureV2Fields(s);
+  res.json({
+    consecutiveLoss: s.consecutiveLoss, consecutiveWin: s.consecutiveWin,
+    hardStopActive: s.hardStopActive, cauBreakCount: s.cauBreakCount,
+    lastCauType: s.lastCauType, lastCauSignature: s.lastCauSignature,
+    antiStreakLock: s.antiStreakLock, antiStreakCooldown: s.antiStreakCooldown,
+  });
 });
 
 app.post('/api/reset/history', (_, res) => {
@@ -1449,11 +1592,11 @@ app.get('/api/report', (req, res) => {
 app.use((req, res) => res.status(404).json({ error: 'NOT_FOUND', path: req.path, hint: 'Mở / hoặc /tool để xem UI' }));
 
 // ═══════════════════════════════════════════════════════════
-// STARTUP (KHÔNG DEMO — CHỈ SERVER)
+// STARTUP
 // ═══════════════════════════════════════════════════════════
 function startServer() {
   log('══════════════════════════════════════════════');
-  log('🚀 TAIXIU-AI v10 — FULL (NO DEMO) + CẦU MEMORY');
+  log('🚀 TAIXIU-AI v11 — KHÔNG SKIP + ANTI-STREAK LOCK');
   log('══════════════════════════════════════════════');
 
   const ips = [];
@@ -1470,7 +1613,7 @@ function startServer() {
     log('');
     log('📱 UI: / hoặc /tool');
     log('🔌 API:');
-    log('   GET  /api/predict/:game/:table[?mode=conservative]');
+    log('   GET  /api/predict/:game/:table  (LUÔN trả dự đoán, không skip)');
     log('   GET  /api/jsonp/:game/:table?callback=fn');
     log('   GET  /predict/:type (hu|md5)');
     log('   GET  /api/games | /api/info | /health');
